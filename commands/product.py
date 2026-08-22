@@ -606,7 +606,7 @@ class ProductCog(commands.Cog):
             return await _admin_denied(interaction)
         await interaction.response.send_modal(CreateModal1(source_interaction=interaction))
 
-    @product_group.command(name='createtype', description='Create a new product type, optionally linking it to an existing forum channel instead of creating one')
+    @product_group.command(name='createtype', description='Create a new product type and linking it to an existing forum channel instead of creating one')
     @app_commands.describe(nama='Nama jenis produk', channel='Opsional: forum channel yang sudah ada untuk dihubungkan (kosongkan untuk membuat forum baru otomatis)')
     async def createtype(self, interaction: discord.Interaction, nama: str, channel: discord.ForumChannel | None = None):
         if not await self._guild_check(interaction):
