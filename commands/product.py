@@ -12,14 +12,21 @@ from discord.ext import commands
 
 from utils.logger import log_command_activity
 from utils.products import (
+    add_group_whitelist,
+    add_place_whitelist,
+    auto_revoke_product_for_user,
+    auto_whitelist_product_for_user,
     create_or_sync_product_type_forum,
     delete_product,
+    get_place_whitelist,
     get_product,
     get_products_by_ids,
     give_product_to_user,
     link_existing_forum_to_type,
     list_product_types,
     list_products_by_type,
+    remove_group_whitelist,
+    remove_place_whitelist,
     revoke_product_from_user,
     save_product,
     user_owns_product,
@@ -41,6 +48,10 @@ LOG_SCHEMA = {
         'give': {'label': 'Product — Given', 'fields': ['discordUser', 'targetUser', 'productId', 'productName']},
         'revoke': {'label': 'Product — Revoked', 'fields': ['discordUser', 'targetUser', 'productId', 'productName']},
         'get': {'label': 'Product — File Link Requested', 'fields': ['discordUser', 'productId', 'productName']},
+        'whitelistadd': {'label': 'Product — Place Whitelisted', 'fields': ['discordUser', 'targetUser', 'productId', 'placeId']},
+        'whitelistremove': {'label': 'Product — Place Whitelist Removed', 'fields': ['discordUser', 'targetUser', 'productId', 'placeId']},
+        'groupwhitelistadd': {'label': 'Product — Group Whitelisted', 'fields': ['discordUser', 'productId', 'groupId']},
+        'groupwhitelistremove': {'label': 'Product — Group Whitelist Removed', 'fields': ['discordUser', 'productId', 'groupId']},
     },
 }
 
@@ -595,9 +606,9 @@ class ProductCog(commands.Cog):
             return await _admin_denied(interaction)
         await interaction.response.send_modal(CreateModal1(source_interaction=interaction))
 
-    @product_group.command(name='createtype', description='Create (or re-sync) a product type and its dedicated forum channel')
-    @app_commands.describe(nama='Nama jenis produk')
-    async def createtype(self, interaction: discord.Interaction, nama: str):
+    @product_group.command(name='createtype', description='Create a new product type, optionally linking it to an existing forum channel instead of creating one')
+    @app_commands.describe(nama='Nama jenis produk', channel='Opsional: forum channel yang sudah ada untuk dihubungkan (kosongkan untuk membuat forum baru otomatis)')
+    async def createtype(self, interaction: discord.Interaction, nama: str, channel: discord.ForumChannel | None = None):
         if not await self._guild_check(interaction):
             return
         if not _require_admin(interaction):
@@ -608,6 +619,29 @@ class ProductCog(commands.Cog):
         type_name = nama.strip()
         if not type_name:
             return await interaction.followup.send('Nama jenis tidak boleh kosong.')
+
+        if channel is not None:
+            try:
+                result = await link_existing_forum_to_type(interaction.guild, str(interaction.guild_id), type_name, channel)
+            except Exception as err:  # noqa: BLE001
+                print(f'link_existing_forum_to_type failed (via createtype): {err}')
+                await log_command_activity(
+                    interaction, subcommand='createtype', success=False,
+                    fields={'discordUser': interaction.user, 'typeName': type_name}, note='Linking existing forum channel failed.',
+                )
+                return await interaction.followup.send('Bot error saat menghubungkan jenis produk ke channel. Cek permission Manage Channels bot di channel tersebut.')
+
+            await log_command_activity(
+                interaction, subcommand='createtype', success=True,
+                fields={'discordUser': interaction.user, 'typeName': type_name, 'forumChannel': result['forumChannel']},
+            )
+
+            note = (
+                f'Jenis produk **{type_name}** sekarang terhubung ke {result["forumChannel"].mention}. Forum lama (kalau berbeda) tidak dihapus.'
+                if result['wasExistingType']
+                else f'Jenis produk **{type_name}** dibuat dan dihubungkan ke {result["forumChannel"].mention}.'
+            )
+            return await interaction.followup.send(note)
 
         try:
             result = await create_or_sync_product_type_forum(interaction.guild, str(interaction.guild_id), type_name)
@@ -889,12 +923,21 @@ class ProductCog(commands.Cog):
             )
             return await interaction.followup.send('Gagal memberikan produk ke database. Coba lagi.')
 
+        auto_note = ''
+        try:
+            granted_group_ids = await auto_whitelist_product_for_user(product_id, str(user.id))
+            if granted_group_ids:
+                auto_note = f" Otomatis di-whitelist ke group yang sudah ditautkan: {', '.join(f'`{g}`' for g in granted_group_ids)}."
+        except Exception as err:  # noqa: BLE001
+            print(f'auto_whitelist_product_for_user failed (product still given): {err}')
+            auto_note = ' (Auto-whitelist ke group gagal, cek manual dengan /product groupwhitelist.)'
+
         await log_command_activity(
             interaction, subcommand='give', success=True,
             fields={'discordUser': interaction.user, 'targetUser': user, 'productId': product_id, 'productName': product['name']},
         )
 
-        await interaction.followup.send(f"Produk **{product['name']}** berhasil diberikan ke {user.mention}.")
+        await interaction.followup.send(f"Produk **{product['name']}** berhasil diberikan ke {user.mention}.{auto_note}")
 
     @product_group.command(name='revoke', description='Revoke a product from a user')
     @app_commands.describe(user='Target user', product_uuid='ID produk (UUID)')
@@ -935,12 +978,108 @@ class ProductCog(commands.Cog):
             )
             return await interaction.followup.send('Gagal mencabut produk dari database. Coba lagi.')
 
+        auto_note = ''
+        try:
+            removed_group_ids = await auto_revoke_product_for_user(product_id, str(user.id))
+            if removed_group_ids:
+                auto_note = f" Whitelist otomatis ke group juga dicabut: {', '.join(f'`{g}`' for g in removed_group_ids)}."
+        except Exception as err:  # noqa: BLE001
+            print(f'auto_revoke_product_for_user failed (product still revoked): {err}')
+            auto_note = ' (Gagal auto-cabut whitelist group, cek manual dengan /product groupwhitelist.)'
+
         await log_command_activity(
             interaction, subcommand='revoke', success=True,
             fields={'discordUser': interaction.user, 'targetUser': user, 'productId': product_id, 'productName': product['name']},
         )
 
-        await interaction.followup.send(f"Produk **{product['name']}** berhasil dicabut dari {user.mention}.")
+        await interaction.followup.send(f"Produk **{product['name']}** berhasil dicabut dari {user.mention}.{auto_note}")
+
+    @product_group.command(name='whitelist', description='Whitelist a verified user to use a product in one specific Roblox place')
+    @app_commands.describe(user='Developer to whitelist', product_uuid='ID produk (UUID)', place_id='Roblox place ID (numeric)', action='add or remove')
+    @app_commands.choices(action=[
+        app_commands.Choice(name='add', value='add'),
+        app_commands.Choice(name='remove', value='remove'),
+    ])
+    async def whitelist(self, interaction: discord.Interaction, user: discord.User, product_uuid: str, place_id: str, action: app_commands.Choice[str]):
+        if not await self._guild_check(interaction):
+            return
+        if not _require_admin(interaction):
+            return await _admin_denied(interaction)
+
+        await interaction.response.defer(ephemeral=True)
+
+        product_id = product_uuid.strip()
+        place_id = place_id.strip()
+
+        if not place_id.isdigit():
+            return await interaction.followup.send('Place ID harus berupa angka.')
+
+        product = await get_product(product_id)
+        if not product:
+            return await interaction.followup.send(f'Produk dengan ID `{product_id}` tidak ditemukan.')
+
+        verified_record = await get_verified_user(str(user.id))
+        if not verified_record:
+            return await interaction.followup.send(f'{user.mention} belum verifikasi. Suruh mereka jalankan `/verify start` dulu.')
+
+        sub = 'whitelistadd' if action.value == 'add' else 'whitelistremove'
+
+        if action.value == 'add':
+            await add_place_whitelist(product_id, str(user.id), place_id)
+            verb = 'ditambahkan ke'
+        else:
+            await remove_place_whitelist(product_id, str(user.id), place_id)
+            verb = 'dicabut dari'
+
+        await log_command_activity(
+            interaction, subcommand=sub, success=True,
+            fields={'discordUser': interaction.user, 'targetUser': user, 'productId': product_id, 'placeId': place_id},
+        )
+        await interaction.followup.send(
+            f"Akses produk **{product['name']}** untuk {user.mention} di place `{place_id}` berhasil {verb} whitelist."
+        )
+
+    @product_group.command(name='groupwhitelist', description='Whitelist a product for use by ANY member of a Roblox group who has linked it')
+    @app_commands.describe(product_uuid='ID produk (UUID)', group_id='Roblox group ID (numeric)', action='add or remove')
+    @app_commands.choices(action=[
+        app_commands.Choice(name='add', value='add'),
+        app_commands.Choice(name='remove', value='remove'),
+    ])
+    async def groupwhitelist(self, interaction: discord.Interaction, product_uuid: str, group_id: str, action: app_commands.Choice[str]):
+        if not await self._guild_check(interaction):
+            return
+        if not _require_admin(interaction):
+            return await _admin_denied(interaction)
+
+        await interaction.response.defer(ephemeral=True)
+
+        product_id = product_uuid.strip()
+        group_id = group_id.strip()
+
+        if not group_id.isdigit():
+            return await interaction.followup.send('Group ID harus berupa angka.')
+
+        product = await get_product(product_id)
+        if not product:
+            return await interaction.followup.send(f'Produk dengan ID `{product_id}` tidak ditemukan.')
+
+        sub = 'groupwhitelistadd' if action.value == 'add' else 'groupwhitelistremove'
+
+        if action.value == 'add':
+            await add_group_whitelist(product_id, group_id)
+            verb = 'sekarang bisa dipakai oleh'
+        else:
+            await remove_group_whitelist(product_id, group_id)
+            verb = 'tidak lagi bisa dipakai oleh'
+
+        await log_command_activity(
+            interaction, subcommand=sub, success=True,
+            fields={'discordUser': interaction.user, 'productId': product_id, 'groupId': group_id},
+        )
+        await interaction.followup.send(
+            f"Produk **{product['name']}** {verb} anggota group `{group_id}` yang sudah `/verify linkgroup` "
+            f"-- di place manapun yang dimiliki group itu, selama mereka masih anggotanya."
+        )
 
     @product_group.command(name='get', description='Get the file link of a product you own, sent to your DM')
     @app_commands.describe(product_uuid='ID produk (UUID)')

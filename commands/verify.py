@@ -18,12 +18,15 @@ from utils.verification import (
     description_contains_code,
     fetch_roblox_description,
     fetch_roblox_profile_details,
+    fetch_user_group_ids,
     get_guild_config,
     get_session,
     get_verified_user,
+    link_group,
     remove_verified_user,
     save_verified_user,
     set_guild_role,
+    unlink_group,
 )
 
 COMMAND_NAME = 'verify'
@@ -35,6 +38,8 @@ LOG_SCHEMA = {
         'unverify': {'label': 'Verify — Unverify', 'fields': ['discordUser', 'robloxUsername']},
         'profile': {'label': 'Verify — Profile Lookup', 'fields': ['discordUser', 'targetUser']},
         'verifyComplete': {'label': 'Verify — Completed', 'fields': ['discordUser', 'robloxUsername']},
+        'linkgroup': {'label': 'Verify — Group Linked', 'fields': ['discordUser', 'groupId']},
+        'unlinkgroup': {'label': 'Verify — Group Unlinked', 'fields': ['discordUser', 'groupId']},
     },
 }
 
@@ -414,6 +419,67 @@ class VerifyCog(commands.Cog):
         # showModal() must be the very first thing that happens on this
         # interaction -- no Firestore read before it.
         await interaction.response.send_modal(UnverifyModal(source_interaction=interaction))
+
+    @verify_group.command(name='linkgroup', description='Link a Roblox group you belong to, so its places can use your whitelisted products')
+    @app_commands.describe(group_id='Roblox group ID (numeric)')
+    async def linkgroup(self, interaction: discord.Interaction, group_id: str):
+        await interaction.response.defer(ephemeral=True)
+
+        group_id = group_id.strip()
+        if not group_id.isdigit():
+            return await interaction.followup.send('Group ID harus berupa angka. Contoh: `12345678`.')
+
+        record = await get_verified_user(str(interaction.user.id))
+        if not record:
+            await log_command_activity(
+                interaction, subcommand='linkgroup', success=False,
+                fields={'discordUser': interaction.user, 'groupId': group_id}, note='User is not verified.',
+            )
+            return await interaction.followup.send('Kamu harus verifikasi akun Roblox dulu lewat `/verify start`.')
+
+        try:
+            member_group_ids = await fetch_user_group_ids(record['robloxId'])
+        except Exception as err:  # noqa: BLE001
+            print(f'fetch_user_group_ids failed: {err}')
+            await log_command_activity(
+                interaction, subcommand='linkgroup', success=False,
+                fields={'discordUser': interaction.user, 'groupId': group_id}, note='Roblox groups API call failed.',
+            )
+            return await interaction.followup.send('Gagal mengambil daftar group Roblox kamu. Coba lagi nanti.')
+
+        if group_id not in member_group_ids:
+            await log_command_activity(
+                interaction, subcommand='linkgroup', success=False,
+                fields={'discordUser': interaction.user, 'groupId': group_id}, note='User is not a member of that group.',
+            )
+            return await interaction.followup.send(
+                f'Akun Roblox kamu (**{record["robloxUsername"]}**) bukan anggota group `{group_id}`. '
+                f'Pastikan kamu sudah join group itu, baru jalankan lagi.'
+            )
+
+        await link_group(str(interaction.user.id), group_id)
+        await log_command_activity(
+            interaction, subcommand='linkgroup', success=True,
+            fields={'discordUser': interaction.user, 'groupId': group_id},
+        )
+        await interaction.followup.send(
+            f'Group `{group_id}` berhasil ditautkan ke akunmu. Produk yang di-whitelist ke group ini sekarang bisa '
+            f'kamu pakai di place manapun yang dimiliki group tersebut -- selama kamu masih jadi anggotanya. '
+            f'Kalau kamu keluar dari group, akses ini otomatis hilang.'
+        )
+
+    @verify_group.command(name='unlinkgroup', description='Unlink a previously linked Roblox group')
+    @app_commands.describe(group_id='Roblox group ID (numeric)')
+    async def unlinkgroup(self, interaction: discord.Interaction, group_id: str):
+        await interaction.response.defer(ephemeral=True)
+
+        group_id = group_id.strip()
+        await unlink_group(str(interaction.user.id), group_id)
+        await log_command_activity(
+            interaction, subcommand='unlinkgroup', success=True,
+            fields={'discordUser': interaction.user, 'groupId': group_id},
+        )
+        await interaction.followup.send(f'Group `{group_id}` sudah dilepas dari akunmu.')
 
     @verify_group.command(name='profile', description="Look up a member's linked Roblox profile")
     @app_commands.describe(user='Discord user to look up')
