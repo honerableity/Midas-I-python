@@ -8,6 +8,7 @@ import time
 import unicodedata
 
 import aiohttp
+from google.cloud.firestore_v1 import ArrayRemove, ArrayUnion
 
 from data.words import WORDS
 from utils.firebase import db
@@ -160,3 +161,40 @@ def normalize(s: str) -> str:
 
 def description_contains_code(description: str, code: str) -> bool:
     return normalize(code) in normalize(description or '')
+
+
+# ---------------------------------------------------------------------------
+# Group linking (/verify linkgroup) -- lets a verified dev tie a Roblox
+# group to their account so the Vercel /api/validate endpoint can grant
+# access to any place owned by that group, for products the group itself
+# has been whitelisted for (see utils/products.add_group_whitelist).
+#
+# Membership is checked live at link time here, AND re-checked live on every
+# /api/validate call -- this file does not cache "is still a member".
+# ---------------------------------------------------------------------------
+
+async def fetch_user_group_ids(roblox_id) -> list[str]:
+    """Live list of group ids robloxId currently belongs to."""
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f'https://groups.roblox.com/v1/users/{roblox_id}/groups/roles') as res:
+            if res.status != 200:
+                raise RuntimeError(f'Roblox groups fetch failed: {res.status}')
+            data = await res.json()
+    return [str(g['group']['id']) for g in (data.get('data') or [])]
+
+
+async def link_group(discord_id: str, group_id: str):
+    """Adds group_id to this discord user's linkedGroupIds. Caller must
+    verify group membership BEFORE calling this (see /verify linkgroup).
+    """
+    db.collection('verifiedUsers').document(discord_id).set(
+        {'linkedGroupIds': ArrayUnion([str(group_id)])},
+        merge=True,
+    )
+
+
+async def unlink_group(discord_id: str, group_id: str):
+    db.collection('verifiedUsers').document(discord_id).set(
+        {'linkedGroupIds': ArrayRemove([str(group_id)])},
+        merge=True,
+    )

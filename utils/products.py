@@ -249,6 +249,124 @@ async def get_products_by_ids(product_ids: list[str]):
     return [{'id': doc.id, **doc.to_dict()} for doc in docs if doc.exists]
 
 
+# ---------------------------------------------------------------------------
+# Per-place whitelisting (for the Vercel /api/validate endpoint used by
+# Roblox Studio / in-game HttpService). Two grant types:
+#   productWhitelists/{productId}_{discordId}      -> explicit place list
+#   productGroupWhitelists/{productId}_{groupId}    -> product usable by any
+#                                                       verified user who has
+#                                                       linked that group AND
+#                                                       is still a member
+# ---------------------------------------------------------------------------
+
+def _whitelist_doc_id(product_id: str, discord_id: str) -> str:
+    return f'{product_id}_{discord_id}'
+
+
+def _group_whitelist_doc_id(product_id: str, group_id: str) -> str:
+    return f'{product_id}_{group_id}'
+
+
+async def add_place_whitelist(product_id: str, discord_id: str, place_id: str):
+    """Grants discord_id explicit access to product_id in one specific place."""
+    db.collection('productWhitelists').document(_whitelist_doc_id(product_id, discord_id)).set(
+        {
+            'productId': product_id,
+            'discordId': discord_id,
+            'placeIds': ArrayUnion([str(place_id)]),
+            'updatedAt': _now_ms(),
+        },
+        merge=True,
+    )
+
+
+async def remove_place_whitelist(product_id: str, discord_id: str, place_id: str):
+    db.collection('productWhitelists').document(_whitelist_doc_id(product_id, discord_id)).set(
+        {'placeIds': ArrayRemove([str(place_id)]), 'updatedAt': _now_ms()},
+        merge=True,
+    )
+
+
+async def get_place_whitelist(product_id: str, discord_id: str):
+    doc = db.collection('productWhitelists').document(_whitelist_doc_id(product_id, discord_id)).get()
+    if not doc.exists:
+        return None
+    return doc.to_dict()
+
+
+async def add_group_whitelist(product_id: str, group_id: str, *, auto_granted: bool = False):
+    """Grants product_id to any verified user who has linked group_id to
+    their account (via /verify linkgroup) and is still a member of it --
+    membership is re-checked live by the validate API, not cached here.
+
+    auto_granted marks this grant as having been created automatically
+    (by /product give or a ticket order being marked done) rather than by
+    an admin running /product groupwhitelist directly. This lets the
+    auto-revoke path (see remove_auto_group_whitelists_for_user below)
+    clean up only what it granted, without touching grants an admin made
+    on purpose for unrelated reasons.
+    """
+    doc_ref = db.collection('productGroupWhitelists').document(_group_whitelist_doc_id(product_id, group_id))
+    data = {
+        'productId': product_id,
+        'groupId': str(group_id),
+        'createdAt': _now_ms(),
+    }
+    if auto_granted:
+        # Only set autoGranted=True if the doc doesn't already exist as a
+        # manual admin grant -- an auto-grant should never downgrade or
+        # relabel a grant an admin explicitly made.
+        existing = doc_ref.get()
+        if not existing.exists:
+            data['autoGranted'] = True
+    doc_ref.set(data, merge=True)
+
+
+async def remove_group_whitelist(product_id: str, group_id: str):
+    db.collection('productGroupWhitelists').document(_group_whitelist_doc_id(product_id, group_id)).delete()
+
+
+async def auto_whitelist_product_for_user(product_id: str, discord_id: str):
+    """Called right after a product is granted to a verified user (via
+    /product give or a completed ticket order). Auto-whitelists the
+    product to every Roblox group that user currently has linked, so it
+    becomes usable in that group's places without an admin having to run
+    /product groupwhitelist manually for each one.
+
+    No-op if the user has no linked groups yet -- they'll just have plain
+    ownership until they /verify linkgroup and an admin (or a future
+    give/order) triggers this again.
+    """
+    user_doc = db.collection('verifiedUsers').document(discord_id).get()
+    if not user_doc.exists:
+        return []
+    linked_group_ids = (user_doc.to_dict() or {}).get('linkedGroupIds') or []
+    for group_id in linked_group_ids:
+        await add_group_whitelist(product_id, group_id, auto_granted=True)
+    return linked_group_ids
+
+
+async def auto_revoke_product_for_user(product_id: str, discord_id: str):
+    """Called right after a product is revoked from a verified user. Removes
+    ONLY the auto-granted group whitelists this product/user pair produced
+    (autoGranted=True) -- a group whitelist an admin set up on purpose via
+    /product groupwhitelist is left alone, since other members of that group
+    may still be relying on it.
+    """
+    user_doc = db.collection('verifiedUsers').document(discord_id).get()
+    if not user_doc.exists:
+        return []
+    linked_group_ids = (user_doc.to_dict() or {}).get('linkedGroupIds') or []
+    removed = []
+    for group_id in linked_group_ids:
+        doc_ref = db.collection('productGroupWhitelists').document(_group_whitelist_doc_id(product_id, group_id))
+        doc = doc_ref.get()
+        if doc.exists and doc.to_dict().get('autoGranted'):
+            doc_ref.delete()
+            removed.append(group_id)
+    return removed
+
+
 _URL_RE = re.compile(r'^https?://', re.IGNORECASE)
 
 
