@@ -13,20 +13,18 @@ from discord.ext import commands
 from utils.logger import log_command_activity
 from utils.products import (
     add_group_whitelist,
-    add_place_whitelist,
     auto_revoke_product_for_user,
     auto_whitelist_product_for_user,
     create_or_sync_product_type_forum,
     delete_product,
-    get_place_whitelist,
     get_product,
     get_products_by_ids,
     give_product_to_user,
     link_existing_forum_to_type,
     list_product_types,
+    list_products_by_guild,
     list_products_by_type,
     remove_group_whitelist,
-    remove_place_whitelist,
     revoke_product_from_user,
     save_product,
     user_owns_product,
@@ -48,8 +46,6 @@ LOG_SCHEMA = {
         'give': {'label': 'Product — Given', 'fields': ['discordUser', 'targetUser', 'productId', 'productName']},
         'revoke': {'label': 'Product — Revoked', 'fields': ['discordUser', 'targetUser', 'productId', 'productName']},
         'get': {'label': 'Product — File Link Requested', 'fields': ['discordUser', 'productId', 'productName']},
-        'whitelistadd': {'label': 'Product — Place Whitelisted', 'fields': ['discordUser', 'targetUser', 'productId', 'placeId']},
-        'whitelistremove': {'label': 'Product — Place Whitelist Removed', 'fields': ['discordUser', 'targetUser', 'productId', 'placeId']},
         'groupwhitelistadd': {'label': 'Product — Group Whitelisted', 'fields': ['discordUser', 'productId', 'groupId']},
         'groupwhitelistremove': {'label': 'Product — Group Whitelist Removed', 'fields': ['discordUser', 'productId', 'groupId']},
     },
@@ -584,6 +580,23 @@ async def _autocomplete_get_product_uuid(interaction: discord.Interaction, curre
 
 
 # ---------------------------------------------------------------------------
+# Admin-facing autocomplete -- every product in the guild, not just ones the
+# invoking user owns. Used on edit/delete/give/revoke/sendpost/groupwhitelist.
+# ---------------------------------------------------------------------------
+async def _autocomplete_any_product_uuid(interaction: discord.Interaction, current: str):
+    if interaction.guild_id is None:
+        return []
+
+    focused = (current or '').lower()
+    products = await list_products_by_guild(str(interaction.guild_id))
+    filtered = [p for p in products if focused in (p.get('name') or '').lower()][:25]
+    return [
+        app_commands.Choice(name=f"{p['name']} ({p['id'][:8]})"[:100], value=p['id'])
+        for p in filtered
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Cog
 # ---------------------------------------------------------------------------
 class ProductCog(commands.Cog):
@@ -606,7 +619,7 @@ class ProductCog(commands.Cog):
             return await _admin_denied(interaction)
         await interaction.response.send_modal(CreateModal1(source_interaction=interaction))
 
-    @product_group.command(name='createtype', description='Create a new product type and linking it to an existing forum channel instead of creating one')
+    @product_group.command(name='createtype', description='Create a product type, optionally linking an existing forum instead of making one')
     @app_commands.describe(nama='Nama jenis produk', channel='Opsional: forum channel yang sudah ada untuk dihubungkan (kosongkan untuk membuat forum baru otomatis)')
     async def createtype(self, interaction: discord.Interaction, nama: str, channel: discord.ForumChannel | None = None):
         if not await self._guild_check(interaction):
@@ -699,6 +712,7 @@ class ProductCog(commands.Cog):
 
     @product_group.command(name='sendpost', description="Post a product to its type's forum channel")
     @app_commands.describe(product_uuid='ID produk (UUID)')
+    @app_commands.autocomplete(product_uuid=_autocomplete_any_product_uuid)
     async def sendpost(self, interaction: discord.Interaction, product_uuid: str):
         if not await self._guild_check(interaction):
             return
@@ -827,6 +841,7 @@ class ProductCog(commands.Cog):
 
     @product_group.command(name='edit', description='Edit an existing product listing')
     @app_commands.describe(product_uuid='ID produk (UUID)')
+    @app_commands.autocomplete(product_uuid=_autocomplete_any_product_uuid)
     async def edit(self, interaction: discord.Interaction, product_uuid: str):
         if not await self._guild_check(interaction):
             return
@@ -867,6 +882,7 @@ class ProductCog(commands.Cog):
 
     @product_group.command(name='delete', description='Delete a product')
     @app_commands.describe(product_uuid='ID produk (UUID)')
+    @app_commands.autocomplete(product_uuid=_autocomplete_any_product_uuid)
     async def delete(self, interaction: discord.Interaction, product_uuid: str):
         if not await self._guild_check(interaction):
             return
@@ -878,6 +894,7 @@ class ProductCog(commands.Cog):
 
     @product_group.command(name='give', description='Give a product to a verified user')
     @app_commands.describe(user='Target user', product_uuid='ID produk (UUID)')
+    @app_commands.autocomplete(product_uuid=_autocomplete_any_product_uuid)
     async def give(self, interaction: discord.Interaction, user: discord.User, product_uuid: str):
         if not await self._guild_check(interaction):
             return
@@ -941,6 +958,7 @@ class ProductCog(commands.Cog):
 
     @product_group.command(name='revoke', description='Revoke a product from a user')
     @app_commands.describe(user='Target user', product_uuid='ID produk (UUID)')
+    @app_commands.autocomplete(product_uuid=_autocomplete_any_product_uuid)
     async def revoke(self, interaction: discord.Interaction, user: discord.User, product_uuid: str):
         if not await self._guild_check(interaction):
             return
@@ -994,57 +1012,13 @@ class ProductCog(commands.Cog):
 
         await interaction.followup.send(f"Produk **{product['name']}** berhasil dicabut dari {user.mention}.{auto_note}")
 
-    @product_group.command(name='whitelist', description='Whitelist a verified user to use a product in one specific Roblox place')
-    @app_commands.describe(user='Developer to whitelist', product_uuid='ID produk (UUID)', place_id='Roblox place ID (numeric)', action='add or remove')
-    @app_commands.choices(action=[
-        app_commands.Choice(name='add', value='add'),
-        app_commands.Choice(name='remove', value='remove'),
-    ])
-    async def whitelist(self, interaction: discord.Interaction, user: discord.User, product_uuid: str, place_id: str, action: app_commands.Choice[str]):
-        if not await self._guild_check(interaction):
-            return
-        if not _require_admin(interaction):
-            return await _admin_denied(interaction)
-
-        await interaction.response.defer(ephemeral=True)
-
-        product_id = product_uuid.strip()
-        place_id = place_id.strip()
-
-        if not place_id.isdigit():
-            return await interaction.followup.send('Place ID harus berupa angka.')
-
-        product = await get_product(product_id)
-        if not product:
-            return await interaction.followup.send(f'Produk dengan ID `{product_id}` tidak ditemukan.')
-
-        verified_record = await get_verified_user(str(user.id))
-        if not verified_record:
-            return await interaction.followup.send(f'{user.mention} belum verifikasi. Suruh mereka jalankan `/verify start` dulu.')
-
-        sub = 'whitelistadd' if action.value == 'add' else 'whitelistremove'
-
-        if action.value == 'add':
-            await add_place_whitelist(product_id, str(user.id), place_id)
-            verb = 'ditambahkan ke'
-        else:
-            await remove_place_whitelist(product_id, str(user.id), place_id)
-            verb = 'dicabut dari'
-
-        await log_command_activity(
-            interaction, subcommand=sub, success=True,
-            fields={'discordUser': interaction.user, 'targetUser': user, 'productId': product_id, 'placeId': place_id},
-        )
-        await interaction.followup.send(
-            f"Akses produk **{product['name']}** untuk {user.mention} di place `{place_id}` berhasil {verb} whitelist."
-        )
-
     @product_group.command(name='groupwhitelist', description='Whitelist a product for use by ANY member of a Roblox group who has linked it')
     @app_commands.describe(product_uuid='ID produk (UUID)', group_id='Roblox group ID (numeric)', action='add or remove')
     @app_commands.choices(action=[
         app_commands.Choice(name='add', value='add'),
         app_commands.Choice(name='remove', value='remove'),
     ])
+    @app_commands.autocomplete(product_uuid=_autocomplete_any_product_uuid)
     async def groupwhitelist(self, interaction: discord.Interaction, product_uuid: str, group_id: str, action: app_commands.Choice[str]):
         if not await self._guild_check(interaction):
             return
