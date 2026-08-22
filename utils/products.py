@@ -195,6 +195,15 @@ async def list_products_by_type(guild_id: str, type_id: str):
     return [{'id': doc.id, **doc.to_dict()} for doc in query.stream()]
 
 
+async def list_products_by_guild(guild_id: str):
+    """All products in a guild, across every type. Used for admin-facing
+    autocomplete (edit/delete/give/revoke/sendpost/groupwhitelist) where any
+    product could be the target, not just ones the invoking user owns.
+    """
+    query = db.collection('products').where('guildId', '==', guild_id)
+    return [{'id': doc.id, **doc.to_dict()} for doc in query.stream()]
+
+
 async def save_product(product_id: str, data: dict):
     db.collection('products').document(product_id).set(data)
 
@@ -250,48 +259,17 @@ async def get_products_by_ids(product_ids: list[str]):
 
 
 # ---------------------------------------------------------------------------
-# Per-place whitelisting (for the Vercel /api/validate endpoint used by
-# Roblox Studio / in-game HttpService). Two grant types:
-#   productWhitelists/{productId}_{discordId}      -> explicit place list
-#   productGroupWhitelists/{productId}_{groupId}    -> product usable by any
-#                                                       verified user who has
-#                                                       linked that group AND
-#                                                       is still a member
+# Whitelisting for the Vercel /api/validate endpoint used by Roblox Studio /
+# in-game HttpService. Access is granted by EITHER:
+#   - plain ownership (products/{id}.owners, see user_owns_product above) --
+#     grants use in ANY place, no place-scoping at all
+#   - productGroupWhitelists/{productId}_{groupId} -> product usable by any
+#     verified user who has linked that group AND is still a member of it,
+#     restricted to that group's own places
 # ---------------------------------------------------------------------------
-
-def _whitelist_doc_id(product_id: str, discord_id: str) -> str:
-    return f'{product_id}_{discord_id}'
-
 
 def _group_whitelist_doc_id(product_id: str, group_id: str) -> str:
     return f'{product_id}_{group_id}'
-
-
-async def add_place_whitelist(product_id: str, discord_id: str, place_id: str):
-    """Grants discord_id explicit access to product_id in one specific place."""
-    db.collection('productWhitelists').document(_whitelist_doc_id(product_id, discord_id)).set(
-        {
-            'productId': product_id,
-            'discordId': discord_id,
-            'placeIds': ArrayUnion([str(place_id)]),
-            'updatedAt': _now_ms(),
-        },
-        merge=True,
-    )
-
-
-async def remove_place_whitelist(product_id: str, discord_id: str, place_id: str):
-    db.collection('productWhitelists').document(_whitelist_doc_id(product_id, discord_id)).set(
-        {'placeIds': ArrayRemove([str(place_id)]), 'updatedAt': _now_ms()},
-        merge=True,
-    )
-
-
-async def get_place_whitelist(product_id: str, discord_id: str):
-    doc = db.collection('productWhitelists').document(_whitelist_doc_id(product_id, discord_id)).get()
-    if not doc.exists:
-        return None
-    return doc.to_dict()
 
 
 async def add_group_whitelist(product_id: str, group_id: str, *, auto_granted: bool = False):
