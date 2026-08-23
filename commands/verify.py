@@ -40,6 +40,7 @@ LOG_SCHEMA = {
         'verifyComplete': {'label': 'Verify — Completed', 'fields': ['discordUser', 'robloxUsername']},
         'linkgroup': {'label': 'Verify — Group Linked', 'fields': ['discordUser', 'groupId']},
         'unlinkgroup': {'label': 'Verify — Group Unlinked', 'fields': ['discordUser', 'groupId']},
+        'sendpanel': {'label': 'Verify — Panel Sent', 'fields': ['discordUser', 'channel']},
     },
 }
 
@@ -343,6 +344,115 @@ class VerifyUsernameModal(discord.ui.Modal, title='Roblox Verification'):
         return await interaction.followup.send(f"Verified! You're linked as **{profile['robloxUsername']}**. Role assigned.")
 
 
+async def _run_verify_start(interaction: discord.Interaction):
+    """Shared body for /verify start and the green button on the verify
+    panel (/verify sendpanel). Panel button interactions don't go through
+    the slash-command tree, so this must be self-contained and not assume
+    it's a slash command context.
+    """
+    if interaction.guild is None:
+        return await interaction.response.send_message('This command only works inside a server.', ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    config = await get_guild_config(str(interaction.guild_id))
+    if not config or not config.get('verifiedRoleId'):
+        return await interaction.followup.send("Verify role isn't set up yet. Ask an admin to run `/verify setrole` first.")
+
+    existing_record = await get_verified_user(str(interaction.user.id))
+    if existing_record:
+        return await interaction.followup.send('You are already verified!')
+
+    existing = await get_session(str(interaction.user.id))
+    if existing:
+        return await interaction.followup.send(
+            f"You already have an active verification code. Check your DMs, or wait "
+            f"<t:{int(existing['expiresAt'] / 1000)}:R> for it to expire before starting over."
+        )
+
+    await interaction.followup.send('Check your DMs! 📬')
+
+    session = await create_session(str(interaction.user.id))
+    code, expires_at = session['code'], session['expiresAt']
+
+    embed = discord.Embed(
+        title='Roblox Verification',
+        description=(
+            f'Copy this code and paste it anywhere in your Roblox profile **About/Description**:\n\n'
+            f'```{code}```\n'
+            f'This code expires <t:{int(expires_at / 1000)}:R>.\n\n'
+            f"Once it's on your profile, click **Verify!** below."
+        ),
+        color=0x00B0F4,
+    )
+
+    view = VerifyDMButtonView(discord_user_id=interaction.user.id, guild_id=interaction.guild_id, source_interaction=interaction)
+
+    try:
+        dm = await interaction.user.send(embed=embed, view=view)
+        view.message = dm
+    except discord.HTTPException:
+        return await interaction.followup.send(
+            'Could not DM you. Please enable DMs from server members and run `/verify start` again.',
+            ephemeral=True,
+        )
+
+    await log_command_activity(interaction, subcommand='start', success=True, fields={'discordUser': interaction.user})
+
+
+# ---------------------------------------------------------------------------
+# /verify sendpanel -- persistent panel embed with a green "Verify!" button
+# that runs the same logic as /verify start. Modelled on /ticket send.
+# ---------------------------------------------------------------------------
+CID_VERIFY_PANEL_BTN = 'verify_panel_start'
+
+
+class VerifyPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label='Verify!', style=discord.ButtonStyle.success, custom_id=CID_VERIFY_PANEL_BTN)
+    async def on_verify_click(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _run_verify_start(interaction)
+
+
+class SendVerifyPanelModal(discord.ui.Modal, title='Verify Panel'):
+    panel_title = discord.ui.TextInput(label='Title', style=discord.TextStyle.short, required=True)
+    panel_description = discord.ui.TextInput(label='Description', style=discord.TextStyle.paragraph, required=True)
+    panel_color = discord.ui.TextInput(label='Color (hex, e.g. #57F287)', placeholder='#57F287', style=discord.TextStyle.short, required=False)
+
+    def __init__(self, source_interaction: discord.Interaction, target_channel: discord.TextChannel):
+        super().__init__()
+        self.source_interaction = source_interaction
+        self.target_channel = target_channel
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        color = 0x57F287
+        color_raw = self.panel_color.value.strip()
+        if color_raw:
+            try:
+                color = int(color_raw.replace('#', ''), 16)
+            except ValueError:
+                pass
+
+        embed = discord.Embed(title=self.panel_title.value.strip(), description=self.panel_description.value.strip(), color=color)
+
+        try:
+            await self.target_channel.send(embed=embed, view=VerifyPanelView())
+        except discord.HTTPException as err:
+            print(f'Failed to send verify panel: {err}')
+            return await interaction.followup.send(f"Couldn't send the panel to {self.target_channel.mention}.")
+
+        await log_command_activity(
+            self.source_interaction, subcommand='sendpanel', success=True,
+            fields={'discordUser': interaction.user, 'channel': self.target_channel},
+        )
+
+        await interaction.followup.send(f'Verify panel sent to {self.target_channel.mention}.')
+
+
 class VerifyCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -351,51 +461,21 @@ class VerifyCog(commands.Cog):
 
     @verify_group.command(name='start', description='Start Roblox verification (DMs you a code)')
     async def start(self, interaction: discord.Interaction):
+        await _run_verify_start(interaction)
+
+    @verify_group.command(name='sendpanel', description='Send a verify panel embed with a button that runs /verify start')
+    @app_commands.describe(channel='Where to send the panel')
+    async def sendpanel(self, interaction: discord.Interaction, channel: discord.TextChannel):
         if interaction.guild is None:
             return await interaction.response.send_message('This command only works inside a server.', ephemeral=True)
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message('You need **Administrator** permission to do that.', ephemeral=True)
 
-        await interaction.response.defer(ephemeral=True)
+        perms = channel.permissions_for(interaction.guild.me)
+        if not perms.send_messages or not perms.view_channel:
+            return await interaction.response.send_message(f"I can't send messages in {channel.mention}. Check my permissions there.", ephemeral=True)
 
-        config = await get_guild_config(str(interaction.guild_id))
-        if not config or not config.get('verifiedRoleId'):
-            return await interaction.followup.send("Verify role isn't set up yet. Ask an admin to run `/verify setrole` first.")
-
-        existing = await get_session(str(interaction.user.id))
-        if existing:
-            return await interaction.followup.send(
-                f"You already have an active verification code. Check your DMs, or wait "
-                f"<t:{int(existing['expiresAt'] / 1000)}:R> for it to expire before starting over."
-            )
-
-        await interaction.followup.send('Check your DMs! 📬')
-
-        session = await create_session(str(interaction.user.id))
-        code, expires_at = session['code'], session['expiresAt']
-
-        embed = discord.Embed(
-            title='Roblox Verification',
-            description=(
-                f'Copy this code and paste it anywhere in your Roblox profile **About/Description**:\n\n'
-                f'```{code}```\n'
-                f'This code expires <t:{int(expires_at / 1000)}:R>.\n\n'
-                f"Once it's on your profile, click **Verify!** below."
-            ),
-            color=0x00B0F4,
-        )
-
-        view = VerifyDMButtonView(discord_user_id=interaction.user.id, guild_id=interaction.guild_id, source_interaction=interaction)
-
-        try:
-            dm = await interaction.user.send(embed=embed, view=view)
-            view.message = dm
-        except discord.HTTPException:
-            return await interaction.followup.send(
-                'Could not DM you. Please enable DMs from server members and run `/verify start` again.',
-                ephemeral=True,
-            )
-
-        await log_command_activity(interaction, subcommand='start', success=True, fields={'discordUser': interaction.user})
-
+        await interaction.response.send_modal(SendVerifyPanelModal(interaction, channel))
     @verify_group.command(name='setrole', description='Set the role given after verification')
     @app_commands.describe(role='Role to assign on verify')
     async def setrole(self, interaction: discord.Interaction, role: discord.Role):
@@ -520,3 +600,6 @@ class VerifyCog(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(VerifyCog(bot))
+    # Register the persistent panel view so its button keeps working after a
+    # bot restart, same pattern as TicketPanelView in commands/ticket.py.
+    bot.add_view(VerifyPanelView())
