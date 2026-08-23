@@ -521,6 +521,15 @@ class DoneModal(discord.ui.Modal, title='Testimonial Image'):
                     await creator.send(**build_product_delivery_dm(product))
                 except discord.HTTPException:
                     delivery_failures.append(f"{item['name']} (DM failed)")
+                    continue
+
+                try:
+                    await creator.send(
+                        f"How was **{item['name']}**? Rate it with `/product rating` (X/10 + why) -- "
+                        f"your review gets posted in the product's forum thread."
+                    )
+                except discord.HTTPException:
+                    pass  # review nudge is best-effort, delivery already succeeded
 
         await close_ticket(str(self.channel_id), {'ticketNumber': ticket_number})
 
