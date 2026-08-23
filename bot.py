@@ -38,6 +38,7 @@ COMMAND_EXTENSIONS = ['log', 'verify', 'mod', 'product', 'ticket']
 UNVERIFIED_ALLOWED = {
     ('verify', 'start'),
     ('verify', 'setrole'),
+    ('verify', 'sendpanel'),
 }
 
 
