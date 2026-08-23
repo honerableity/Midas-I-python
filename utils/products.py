@@ -373,3 +373,20 @@ def build_product_delivery_dm(product: dict):
         embed.add_field(name='Link File', value=file_link, inline=False)
 
     return {'embed': embed, 'view': view}
+
+
+def build_rating_embed(product: dict, rating: int, reason: str, reviewer_name: str):
+    """Embed posted into the product's own forum thread whenever someone
+    submits a /product rating. Separate from the main sendpost listing embed.
+    """
+    from utils.reviews import stars_bar  # local import: avoid module cycle at import time
+
+    color = 0x57F287 if rating >= 7 else (0xFEE75C if rating >= 4 else 0xED4245)
+    embed = discord.Embed(
+        title=f'⭐ New Rating: {rating}/10',
+        description=reason,
+        color=color,
+    )
+    embed.add_field(name='Score', value=f'{stars_bar(rating)}  **{rating}/10**', inline=False)
+    embed.set_footer(text=f'Reviewed by {reviewer_name}')
+    return embed
