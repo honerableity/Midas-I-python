@@ -29,7 +29,9 @@ from utils.products import (
     save_product,
     user_owns_product,
     build_product_delivery_dm,
+    build_rating_embed,
 )
+from utils.reviews import RATING_MAX, RATING_MIN, get_testimony_count, set_testimony_count, submit_review
 from utils.verification import get_verified_user
 
 COMMAND_NAME = 'product'
@@ -48,6 +50,8 @@ LOG_SCHEMA = {
         'get': {'label': 'Product — File Link Requested', 'fields': ['discordUser', 'productId', 'productName']},
         'groupwhitelistadd': {'label': 'Product — Group Whitelisted', 'fields': ['discordUser', 'productId', 'groupId']},
         'groupwhitelistremove': {'label': 'Product — Group Whitelist Removed', 'fields': ['discordUser', 'productId', 'groupId']},
+        'rating': {'label': 'Product — Rated', 'fields': ['discordUser', 'productId', 'productName', 'rating']},
+        'settesticount': {'label': 'Product — Guild Testimony Count Edited', 'fields': ['discordUser', 'count']},
     },
 }
 
@@ -451,6 +455,78 @@ class DeleteConfirmModal(discord.ui.Modal, title='Confirm Delete'):
 
 
 # ---------------------------------------------------------------------------
+# /product rating -- modal(score + reason) -> save review -> post in forum
+# ---------------------------------------------------------------------------
+class RatingModal(discord.ui.Modal, title='Rate this product'):
+    rating_input = discord.ui.TextInput(
+        label=f'Rating ({RATING_MIN}-{RATING_MAX})', placeholder='e.g. 9', style=discord.TextStyle.short,
+        max_length=2, required=True,
+    )
+    reason_input = discord.ui.TextInput(
+        label='Reason', placeholder='Kenapa kasih rating segitu?', style=discord.TextStyle.paragraph, required=True,
+    )
+
+    def __init__(self, source_interaction: discord.Interaction, product: dict, product_id: str, *, ticket_channel_id: str | None = None):
+        super().__init__()
+        self.source_interaction = source_interaction
+        self.product = product
+        self.product_id = product_id
+        self.ticket_channel_id = ticket_channel_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        raw = self.rating_input.value.strip()
+        if not raw.isdigit() or not (RATING_MIN <= int(raw) <= RATING_MAX):
+            return await interaction.followup.send(f'Rating harus angka {RATING_MIN}-{RATING_MAX}. Jalankan `/product rating` lagi.')
+
+        rating = int(raw)
+        reason = self.reason_input.value.strip()
+
+        try:
+            result = await submit_review(
+                self.product_id, str(interaction.user.id), interaction.user.name, rating, reason,
+                ticket_channel_id=self.ticket_channel_id,
+            )
+        except Exception as err:  # noqa: BLE001
+            print(f'Failed to save review to Firestore: {err}')
+            await log_command_activity(
+                self.source_interaction, subcommand='rating', success=False,
+                fields={'discordUser': interaction.user, 'productId': self.product_id, 'productName': self.product['name'], 'rating': rating},
+                note='Firestore write failed.',
+            )
+            return await interaction.followup.send('Gagal menyimpan rating ke database. Coba lagi.')
+
+        post_note = ''
+        forum_id = self.product.get('typeForumId')
+        thread_id = self.product.get('forumThreadId')
+        if forum_id and thread_id:
+            try:
+                guild = interaction.guild or self.source_interaction.guild
+                thread = guild.get_thread(int(thread_id)) if guild else None
+                if thread is None and guild:
+                    thread = await guild.fetch_channel(int(thread_id))
+                if thread:
+                    await thread.send(embed=build_rating_embed(self.product, rating, reason, interaction.user.name))
+            except Exception as err:  # noqa: BLE001
+                print(f'Failed to post rating to forum thread (rating still saved): {err}')
+                post_note = ' (Gagal posting ke forum, tapi rating sudah tersimpan.)'
+        else:
+            post_note = ' (Produk ini belum punya post forum, rating hanya tersimpan di database.)'
+
+        await log_command_activity(
+            self.source_interaction, subcommand='rating', success=True,
+            fields={'discordUser': interaction.user, 'productId': self.product_id, 'productName': self.product['name'], 'rating': rating},
+        )
+
+        verb = 'diperbarui' if result['wasUpdate'] else 'tersimpan'
+        await interaction.followup.send(
+            f"Rating kamu **{rating}/10** untuk **{self.product['name']}** {verb}. "
+            f"Rata-rata sekarang **{result['reviewAvg']}/10** dari {result['reviewCount']} rating.{post_note}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # /product view -- type/product paginator
 # ---------------------------------------------------------------------------
 class ProductViewView(discord.ui.View):
@@ -498,6 +574,12 @@ class ProductViewView(discord.ui.View):
         embed.add_field(name='Jenis', value=product['type'], inline=True)
         embed.add_field(name='Kreator', value=product['creator'], inline=True)
         embed.add_field(name='ID Produk', value=f'`{product["productId"]}`', inline=False)
+
+        if product.get('reviewCount'):
+            embed.add_field(name='Rating', value=f"⭐ {product['reviewAvg']}/10 ({product['reviewCount']} rating)", inline=True)
+        testi_count = await get_testimony_count(self.guild_id)
+        if testi_count:
+            embed.add_field(name='Testimoni', value=str(testi_count), inline=True)
 
         review_media = product.get('reviewMedia') or ''
         if _IMAGE_URL_RE.search(review_media):
@@ -760,6 +842,12 @@ class ProductCog(commands.Cog):
         embed.add_field(name='Harga', value='GRATIS' if is_free else product['price'], inline=True)
         embed.add_field(name='Jenis', value=product['type'], inline=True)
         embed.add_field(name='Kreator', value=product['creator'], inline=True)
+
+        if product.get('reviewCount'):
+            embed.add_field(name='Rating', value=f"⭐ {product['reviewAvg']}/10 ({product['reviewCount']} rating)", inline=True)
+        testi_count = await get_testimony_count(str(interaction.guild_id))
+        if testi_count:
+            embed.add_field(name='Testimoni', value=str(testi_count), inline=True)
 
         if not is_free:
             embed.add_field(name='Link File', value=product['fileLink'], inline=False)
@@ -1103,6 +1191,64 @@ class ProductCog(commands.Cog):
         )
 
         await interaction.followup.send('Sent! Check your DMs 📬')
+
+    @product_group.command(name='rating', description='Rate a product X/10 and say why -- posts in the product forum thread')
+    @app_commands.describe(product_uuid='ID produk (UUID)')
+    @app_commands.autocomplete(product_uuid=_autocomplete_get_product_uuid)
+    async def rating(self, interaction: discord.Interaction, product_uuid: str):
+        if not await self._guild_check(interaction):
+            return
+
+        product_id = product_uuid.strip()
+
+        verified_record = await get_verified_user(str(interaction.user.id))
+        if not verified_record:
+            return await interaction.response.send_message('You are required to verified to use this command!', ephemeral=True)
+
+        product = await get_product(product_id)
+        if not product:
+            await log_command_activity(
+                interaction, subcommand='rating', success=False,
+                fields={'discordUser': interaction.user, 'productId': product_id}, note='Product UUID not found.',
+            )
+            return await interaction.response.send_message(f'Produk dengan ID `{product_id}` tidak ditemukan.', ephemeral=True)
+
+        if not user_owns_product(product, str(interaction.user.id)):
+            await log_command_activity(
+                interaction, subcommand='rating', success=False,
+                fields={'discordUser': interaction.user, 'productId': product_id, 'productName': product['name']},
+                note='Requesting user does not own this product.',
+            )
+            return await interaction.response.send_message('You didnt owned the product!', ephemeral=True)
+
+        await interaction.response.send_modal(RatingModal(interaction, product, product_id))
+
+    @product_group.command(name='settesticount', description='[Admin] Manually set the displayed testimony count for this server')
+    @app_commands.describe(count='New testimony count (whole number)')
+    async def settesticount(self, interaction: discord.Interaction, count: app_commands.Range[int, 0, None]):
+        if not await self._guild_check(interaction):
+            return
+        if not _require_admin(interaction):
+            return await _admin_denied(interaction)
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            await set_testimony_count(str(interaction.guild_id), count)
+        except Exception as err:  # noqa: BLE001
+            print(f'Failed to set testimonyCount: {err}')
+            await log_command_activity(
+                interaction, subcommand='settesticount', success=False,
+                fields={'discordUser': interaction.user, 'count': count}, note='Firestore write failed.',
+            )
+            return await interaction.followup.send('Gagal mengubah testimony count di database. Coba lagi.')
+
+        await log_command_activity(
+            interaction, subcommand='settesticount', success=True,
+            fields={'discordUser': interaction.user, 'count': count},
+        )
+
+        await interaction.followup.send(f'Testimony count server ini diset ke **{count}**.')
 
 
 async def setup(bot: commands.Bot):
