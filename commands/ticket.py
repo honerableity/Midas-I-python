@@ -221,7 +221,7 @@ async def _load_products_map(product_ids: list[str]) -> dict:
 
 def _make_order_select_callback(select_widget: discord.ui.Select):
     async def _callback(interaction: discord.Interaction):
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
 
         product_ids = select_widget.values
         products_map = await _load_products_map(product_ids)
@@ -251,7 +251,7 @@ def _make_order_select_callback(select_widget: discord.ui.Select):
 
 
 async def _order_create_callback(interaction: discord.Interaction):
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=True)
 
     token = interaction.data['custom_id'].replace(f'{CID_ORDER_CREATE_BTN_PREFIX}_', '')
     selection = await get_order_selection(token)
@@ -368,7 +368,7 @@ async def _service_open_modal_callback(interaction: discord.Interaction):
 
 
 async def _cs_create_callback(interaction: discord.Interaction):
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=True)
 
     got_lock = await claim_ticket_create_lock(str(interaction.user.id), 'customerservice')
 
