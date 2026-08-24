@@ -1,12 +1,3 @@
-"""/ticket command -- ticket system (order / service / customer service).
-
-Ported from commands/ticket.js.
-
-The panel embed and its select menu use a *persistent* discord.py View
-(timeout=None, static custom_id) since it must keep working across bot
-restarts, same as the JS version routes ticket_* customIds through a global
-interactionCreate handler instead of a per-command collector.
-"""
 import re
 import time
 import uuid
