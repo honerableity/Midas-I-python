@@ -41,6 +41,7 @@ LOG_SCHEMA = {
         'membercount': {'label': 'Mod — Member Count', 'fields': ['memberCount']},
         'honeypot': {'label': 'Mod — Honeypot Set', 'fields': ['channel']},
         'honeypotTrigger': {'label': 'Mod — Honeypot Triggered', 'fields': ['discordUser', 'channel']},
+        'purge': {'label': 'Mod — Purge', 'fields': ['channel', 'amount', 'discordUser', 'contains', 'deletedCount']},
     },
 }
 
@@ -127,6 +128,16 @@ class ModCog(commands.Cog):
             return False
         if not self._has_perm(interaction):
             await interaction.response.send_message('You need Moderate Members permission to do that.', ephemeral=True)
+            return False
+        await interaction.response.defer(ephemeral=True)
+        return True
+
+    async def _guard_purge(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild is None:
+            await interaction.response.send_message('This command only works inside a server.', ephemeral=True)
+            return False
+        if not interaction.user.guild_permissions.manage_messages:
+            await interaction.response.send_message('You need Manage Messages permission to do that.', ephemeral=True)
             return False
         await interaction.response.defer(ephemeral=True)
         return True
@@ -531,6 +542,67 @@ class ModCog(commands.Cog):
             await log_command_activity(interaction, subcommand='honeypot', success=True, fields={'channel': channel.name})
         except Exception as err:  # noqa: BLE001
             print(f'[mod] honeypot failed: {err}')
+            await interaction.followup.send('Bot error occurred while running that command.')
+
+    # ---------------- purge ----------------
+    @mod_group.command(name='purge', description='Bulk-delete recent messages in this channel')
+    @app_commands.describe(
+        amount='How many messages to delete (1-100)',
+        user='Only delete messages from this user',
+        contains='Only delete messages containing this text',
+    )
+    async def purge(self, interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100],
+                     user: discord.User | None = None, contains: str | None = None):
+        if not await self._guard_purge(interaction):
+            return
+        try:
+            channel = interaction.channel
+            if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+                return await interaction.followup.send("Purge only works in text channels/threads.")
+
+            perms = channel.permissions_for(interaction.guild.me)
+            if not perms.manage_messages or not perms.read_message_history:
+                return await interaction.followup.send("I need Manage Messages and Read Message History here.")
+
+            cutoff = discord.utils.utcnow() - datetime.timedelta(days=14)
+            contains_lower = contains.lower() if contains else None
+
+            def _check(m: discord.Message) -> bool:
+                if m.created_at < cutoff:
+                    return False
+                if user is not None and m.author.id != user.id:
+                    return False
+                if contains_lower is not None and contains_lower not in m.content.lower():
+                    return False
+                return True
+
+            deleted = await channel.purge(limit=amount, check=_check, bulk=True)
+            deleted_count = len(deleted)
+
+            desc_bits = []
+            if user is not None:
+                desc_bits.append(f'from {user}')
+            if contains is not None:
+                desc_bits.append(f'containing "{contains}"')
+            filter_desc = f" ({', '.join(desc_bits)})" if desc_bits else ''
+
+            await interaction.followup.send(f'Purged {deleted_count} message(s){filter_desc}.')
+
+            await log_command_activity(
+                interaction, subcommand='purge', success=True,
+                fields={
+                    'channel': channel.name,
+                    'amount': amount,
+                    'discordUser': user,
+                    'contains': contains,
+                    'deletedCount': deleted_count,
+                },
+            )
+        except discord.HTTPException as err:
+            print(f'[mod] purge failed: {err}')
+            await interaction.followup.send("Couldn't purge — messages may be older than 14 days, or I lack permissions.")
+        except Exception as err:  # noqa: BLE001
+            print(f'[mod] purge failed: {err}')
             await interaction.followup.send('Bot error occurred while running that command.')
 
 
