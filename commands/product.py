@@ -457,6 +457,21 @@ class DeleteConfirmModal(discord.ui.Modal, title='Confirm Delete'):
 # ---------------------------------------------------------------------------
 # /product rating -- modal(score + reason) -> save review -> post in forum
 # ---------------------------------------------------------------------------
+# Drop-in replacement for the RatingModal class in commands/product.py
+#
+# Changes:
+#   1. The review is now always posted as a PUBLIC embed that everyone in
+#      the server can see -- into the product's forum thread if it has one,
+#      otherwise into the channel where /product rating was run.
+#   2. Every message sent back to the rater (success and error paths) is
+#      now explicitly ephemeral=True. Previously the modal only called
+#      interaction.response.defer(ephemeral=True), but the later
+#      interaction.followup.send(...) calls never passed ephemeral=True
+#      themselves -- in discord.py, a deferred-ephemeral interaction does
+#      NOT automatically make its follow-ups ephemeral, so those
+#      confirmation messages were actually visible to everyone. That's
+#      fixed here.
+
 class RatingModal(discord.ui.Modal, title='Rate this product'):
     rating_input = discord.ui.TextInput(
         label=f'Rating ({RATING_MIN}-{RATING_MAX})', placeholder='e.g. 9', style=discord.TextStyle.short,
@@ -478,7 +493,10 @@ class RatingModal(discord.ui.Modal, title='Rate this product'):
 
         raw = self.rating_input.value.strip()
         if not raw.isdigit() or not (RATING_MIN <= int(raw) <= RATING_MAX):
-            return await interaction.followup.send(f'Rating harus angka {RATING_MIN}-{RATING_MAX}. Jalankan `/product rating` lagi.')
+            return await interaction.followup.send(
+                f'Rating harus angka {RATING_MIN}-{RATING_MAX}. Jalankan `/product rating` lagi.',
+                ephemeral=True,
+            )
 
         rating = int(raw)
         reason = self.reason_input.value.strip()
@@ -495,11 +513,16 @@ class RatingModal(discord.ui.Modal, title='Rate this product'):
                 fields={'discordUser': interaction.user, 'productId': self.product_id, 'productName': self.product['name'], 'rating': rating},
                 note='Firestore write failed.',
             )
-            return await interaction.followup.send('Gagal menyimpan rating ke database. Coba lagi.')
+            return await interaction.followup.send('Gagal menyimpan rating ke database. Coba lagi.', ephemeral=True)
+
+        # Build the public-facing review embed once, then decide where it goes.
+        rating_embed = build_rating_embed(self.product, rating, reason, interaction.user.name)
 
         post_note = ''
+        posted_publicly = False
         forum_id = self.product.get('typeForumId')
         thread_id = self.product.get('forumThreadId')
+
         if forum_id and thread_id:
             try:
                 guild = interaction.guild or self.source_interaction.guild
@@ -507,12 +530,21 @@ class RatingModal(discord.ui.Modal, title='Rate this product'):
                 if thread is None and guild:
                     thread = await guild.fetch_channel(int(thread_id))
                 if thread:
-                    await thread.send(embed=build_rating_embed(self.product, rating, reason, interaction.user.name))
+                    await thread.send(embed=rating_embed)
+                    posted_publicly = True
             except Exception as err:  # noqa: BLE001
-                print(f'Failed to post rating to forum thread (rating still saved): {err}')
-                post_note = ' (Gagal posting ke forum, tapi rating sudah tersimpan.)'
-        else:
-            post_note = ' (Produk ini belum punya post forum, rating hanya tersimpan di database.)'
+                print(f'Failed to post rating to forum thread: {err}')
+
+        if not posted_publicly:
+            # No forum thread for this product (or posting to it failed) --
+            # fall back to posting the review embed publicly in the channel
+            # the command was run in, so it's still visible to everyone.
+            try:
+                await interaction.channel.send(embed=rating_embed)
+                posted_publicly = True
+            except discord.HTTPException as err:
+                print(f'Failed to post rating embed to channel: {err}')
+                post_note = ' (Gagal posting embed rating, tapi rating sudah tersimpan.)'
 
         await log_command_activity(
             self.source_interaction, subcommand='rating', success=True,
@@ -522,7 +554,8 @@ class RatingModal(discord.ui.Modal, title='Rate this product'):
         verb = 'diperbarui' if result['wasUpdate'] else 'tersimpan'
         await interaction.followup.send(
             f"Rating kamu **{rating}/10** untuk **{self.product['name']}** {verb}. "
-            f"Rata-rata sekarang **{result['reviewAvg']}/10** dari {result['reviewCount']} rating.{post_note}"
+            f"Rata-rata sekarang **{result['reviewAvg']}/10** dari {result['reviewCount']} rating.{post_note}",
+            ephemeral=True,
         )
 
 
