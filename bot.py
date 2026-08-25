@@ -28,7 +28,26 @@ intents.members = True
 intents.messages = True
 intents.message_content = True
 
-COMMAND_EXTENSIONS = ['log', 'verify', 'mod', 'product', 'ticket']
+
+def _discover_command_extensions() -> list[str]:
+    """Every commands/*.py file becomes an extension name automatically --
+    no more manually keeping a COMMAND_EXTENSIONS list in sync with what's
+    actually on disk. Skips __init__.py (package marker, not a cog) and any
+    other underscore-prefixed file (e.g. _shared.py helpers meant to be
+    imported by other command files, not loaded as a cog themselves).
+    """
+    commands_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'commands')
+    extensions = []
+    for filename in sorted(os.listdir(commands_dir)):
+        if not filename.endswith('.py'):
+            continue
+        if filename.startswith('_'):
+            continue
+        extensions.append(filename[:-len('.py')])
+    return extensions
+
+
+COMMAND_EXTENSIONS = _discover_command_extensions()
 
 # Slash commands that work without being verified yet. Anything else is
 # blocked with a friendly message via VerificationGatedTree below.
