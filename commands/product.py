@@ -32,6 +32,7 @@ from utils.products import (
     build_rating_embed,
 )
 from utils.reviews import RATING_MAX, RATING_MIN, get_testimony_count, set_testimony_count, submit_review
+from utils.reviews_channel import get_reviews_channel, save_reviews_channel, save_reviews_mod_role
 from utils.verification import get_verified_user
 
 COMMAND_NAME = 'product'
@@ -52,6 +53,7 @@ LOG_SCHEMA = {
         'groupwhitelistremove': {'label': 'Product — Group Whitelist Removed', 'fields': ['discordUser', 'productId', 'groupId']},
         'rating': {'label': 'Product — Rated', 'fields': ['discordUser', 'productId', 'productName', 'rating']},
         'settesticount': {'label': 'Product — Guild Testimony Count Edited', 'fields': ['discordUser', 'count']},
+        'setreviewschannel': {'label': 'Product — Reviews Channel Set', 'fields': ['discordUser', 'reviewsChannel', 'modRole']},
     },
 }
 
@@ -505,38 +507,50 @@ class RatingModal(discord.ui.Modal, title='Rate this product'):
 
         post_note = ''
         posted_publicly = False
-        forum_id = self.product.get('typeForumId')
-        thread_id = self.product.get('forumThreadId')
+        guild = interaction.guild or self.source_interaction.guild
 
-        if forum_id and thread_id:
+        # Preferred destination: the guild's dedicated reviews channel, set
+        # via /product setreviewschannel. This is a plain text channel (not
+        # a forum) that everyone can see, so reviews are visible to everyone
+        # regardless of which product/forum they belong to.
+        if guild is not None:
             try:
-                guild = interaction.guild or self.source_interaction.guild
-                thread = guild.get_thread(int(thread_id)) if guild else None
-                if thread is None and guild:
-                    thread = await guild.fetch_channel(int(thread_id))
-                if thread:
-                    await thread.send(embed=rating_embed)
+                reviews_channel = await get_reviews_channel(guild, str(guild.id))
+                if reviews_channel is not None:
+                    await reviews_channel.send(embed=rating_embed)
                     posted_publicly = True
             except Exception as err:  # noqa: BLE001
-                print(f'Failed to post rating to forum thread: {err}')
+                print(f'Failed to post rating to configured reviews channel: {err}')
 
+        # Fallback 1: the product's own forum thread, if it has one and the
+        # reviews channel isn't configured (or posting to it failed).
         if not posted_publicly:
-            # No forum thread for this product (or posting to it failed) --
-            # fall back to posting the review embed publicly in the channel
-            # the command was run in, so it's still visible to everyone.
-            #
-            # interaction.channel can be None if discord.py hasn't cached the
-            # channel (common right after a modal submit), so resolve it
-            # explicitly instead of trusting the cached attribute, and catch
-            # broadly -- an AttributeError here must not silently kill the
-            # rest of on_submit (which would also swallow the ephemeral
-            # confirmation below).
+            forum_id = self.product.get('typeForumId')
+            thread_id = self.product.get('forumThreadId')
+            if forum_id and thread_id and guild is not None:
+                try:
+                    thread = guild.get_thread(int(thread_id))
+                    if thread is None:
+                        thread = await guild.fetch_channel(int(thread_id))
+                    if thread:
+                        await thread.send(embed=rating_embed)
+                        posted_publicly = True
+                except Exception as err:  # noqa: BLE001
+                    print(f'Failed to post rating to forum thread: {err}')
+
+        # Fallback 2: the channel the command was run in.
+        #
+        # interaction.channel can be None if discord.py hasn't cached the
+        # channel (common right after a modal submit), so resolve it
+        # explicitly instead of trusting the cached attribute, and catch
+        # broadly -- an AttributeError here must not silently kill the
+        # rest of on_submit (which would also swallow the ephemeral
+        # confirmation below).
+        if not posted_publicly:
             try:
                 target_channel = interaction.channel
-                if target_channel is None:
-                    guild = interaction.guild or self.source_interaction.guild
-                    if guild is not None:
-                        target_channel = guild.get_channel(interaction.channel_id) or await guild.fetch_channel(interaction.channel_id)
+                if target_channel is None and guild is not None:
+                    target_channel = guild.get_channel(interaction.channel_id) or await guild.fetch_channel(interaction.channel_id)
                 if target_channel is not None:
                     await target_channel.send(embed=rating_embed)
                     posted_publicly = True
@@ -1283,6 +1297,41 @@ class ProductCog(commands.Cog):
         )
 
         await interaction.followup.send(f'Testimony count server ini diset ke **{count}**.')
+
+    @product_group.command(name='setreviewschannel', description='[Admin] Set the channel where product reviews get posted')
+    @app_commands.describe(
+        channel='Text channel where /product rating reviews will be posted',
+        mod_role='Optional: role (besides Administrators) allowed to chat freely in that channel',
+    )
+    async def setreviewschannel(self, interaction: discord.Interaction, channel: discord.TextChannel, mod_role: discord.Role | None = None):
+        if not await self._guild_check(interaction):
+            return
+        if not _require_admin(interaction):
+            return await _admin_denied(interaction)
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            await save_reviews_channel(str(interaction.guild_id), str(channel.id))
+            await save_reviews_mod_role(str(interaction.guild_id), str(mod_role.id) if mod_role else None)
+        except Exception as err:  # noqa: BLE001
+            print(f'Failed to save reviews channel config: {err}')
+            await log_command_activity(
+                interaction, subcommand='setreviewschannel', success=False,
+                fields={'discordUser': interaction.user}, note='Firestore write failed.',
+            )
+            return await interaction.followup.send('Gagal menyimpan pengaturan channel reviews. Coba lagi.')
+
+        await log_command_activity(
+            interaction, subcommand='setreviewschannel', success=True,
+            fields={'discordUser': interaction.user, 'reviewsChannel': channel, 'modRole': mod_role},
+        )
+
+        role_note = f' Role **{mod_role.name}** juga dikecualikan dari cleanup.' if mod_role else ''
+        await interaction.followup.send(
+            f'Channel reviews diset ke {channel.mention}. Semua rating dari `/product rating` akan diposting di sana, '
+            f'dan pesan dari member biasa di channel itu (selain menjalankan `/product rating`) akan otomatis dihapus.{role_note}'
+        )
 
 
 async def setup(bot: commands.Bot):
