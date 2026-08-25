@@ -113,13 +113,19 @@ class StickyCog(commands.Cog):
     # Startup reconciliation
     # -----------------------------------------------------------------
     async def cog_load(self):
-        # Wait until the bot has an active gateway connection so
-        # fetch_channel/fetch_message calls below don't fail during the
-        # brief window right after process start.
-        await self.bot.wait_until_ready()
+        # IMPORTANT: do NOT await wait_until_ready() here. cog_load() runs
+        # from setup_hook() -> load_extension(), which happens BEFORE the
+        # gateway connects and before on_ready can ever fire. Blocking here
+        # would deadlock the whole bot (setup_hook never returns -> gateway
+        # never connects -> on_ready never fires -> wait_until_ready() never
+        # unblocks). Just fire the background task; it does its own wait.
         self.bot.loop.create_task(self._reconcile_all_stickies())
 
     async def _reconcile_all_stickies(self):
+        # Safe to block here -- this runs as an independent background task,
+        # not inline with setup_hook/load_extension.
+        await self.bot.wait_until_ready()
+
         if self._reconciled:
             return
         self._reconciled = True
