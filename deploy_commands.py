@@ -1,8 +1,8 @@
 """Manual slash command deploy script.
 
 Ported from deploy-commands.js. Usually bot.py auto-syncs on boot, but this
-lets you force a redeploy without starting the full bot (e.g. CI, or a quick
-fix after editing a command's options).
+lets you force a redeploy without starting the full bot (e.g. CI, or a
+quick fix after editing a command's options).
 """
 import asyncio
 import os
@@ -23,7 +23,24 @@ if missing:
 TOKEN = os.getenv('DISCORD_TOKEN')
 GUILD_ID = int(os.getenv('GUILD_ID'))
 
-COMMAND_EXTENSIONS = ['log', 'verify', 'mod', 'product', 'ticket']
+
+def _discover_command_extensions() -> list[str]:
+    """Mirrors bot.py's auto-discovery so this script never drifts out of
+    sync with what commands/ actually contains. Skips __init__.py and any
+    other underscore-prefixed file.
+    """
+    commands_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'commands')
+    extensions = []
+    for filename in sorted(os.listdir(commands_dir)):
+        if not filename.endswith('.py'):
+            continue
+        if filename.startswith('_'):
+            continue
+        extensions.append(filename[:-len('.py')])
+    return extensions
+
+
+COMMAND_EXTENSIONS = _discover_command_extensions()
 
 intents = discord.Intents.default()
 intents.guilds = True
