@@ -376,8 +376,10 @@ def build_product_delivery_dm(product: dict):
 
 
 def build_rating_embed(product: dict, rating: int, reason: str, reviewer_name: str):
-    """Embed posted into the product's own forum thread whenever someone
-    submits a /product rating. Separate from the main sendpost listing embed.
+    """Embed posted into the product's own forum thread (or the guild's
+    reviews channel) whenever someone submits a /product rating. Separate
+    from the main sendpost listing embed. Always names the product being
+    reviewed so the embed makes sense on its own, wherever it lands.
     """
     from utils.reviews import stars_bar  # local import: avoid module cycle at import time
 
@@ -387,6 +389,7 @@ def build_rating_embed(product: dict, rating: int, reason: str, reviewer_name: s
         description=reason,
         color=color,
     )
+    embed.add_field(name='Produk', value=product['name'], inline=False)
     embed.add_field(name='Score', value=f'{stars_bar(rating)}  **{rating}/10**', inline=False)
     embed.set_footer(text=f'Reviewed by {reviewer_name}')
     return embed
