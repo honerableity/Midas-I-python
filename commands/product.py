@@ -455,23 +455,8 @@ class DeleteConfirmModal(discord.ui.Modal, title='Confirm Delete'):
 
 
 # ---------------------------------------------------------------------------
-# /product rating -- modal(score + reason) -> save review -> post in forum
+# /product rating -- modal(score + reason) -> save review -> post PUBLIC embed
 # ---------------------------------------------------------------------------
-# Drop-in replacement for the RatingModal class in commands/product.py
-#
-# Changes:
-#   1. The review is now always posted as a PUBLIC embed that everyone in
-#      the server can see -- into the product's forum thread if it has one,
-#      otherwise into the channel where /product rating was run.
-#   2. Every message sent back to the rater (success and error paths) is
-#      now explicitly ephemeral=True. Previously the modal only called
-#      interaction.response.defer(ephemeral=True), but the later
-#      interaction.followup.send(...) calls never passed ephemeral=True
-#      themselves -- in discord.py, a deferred-ephemeral interaction does
-#      NOT automatically make its follow-ups ephemeral, so those
-#      confirmation messages were actually visible to everyone. That's
-#      fixed here.
-
 class RatingModal(discord.ui.Modal, title='Rate this product'):
     rating_input = discord.ui.TextInput(
         label=f'Rating ({RATING_MIN}-{RATING_MAX})', placeholder='e.g. 9', style=discord.TextStyle.short,
@@ -539,10 +524,26 @@ class RatingModal(discord.ui.Modal, title='Rate this product'):
             # No forum thread for this product (or posting to it failed) --
             # fall back to posting the review embed publicly in the channel
             # the command was run in, so it's still visible to everyone.
+            #
+            # interaction.channel can be None if discord.py hasn't cached the
+            # channel (common right after a modal submit), so resolve it
+            # explicitly instead of trusting the cached attribute, and catch
+            # broadly -- an AttributeError here must not silently kill the
+            # rest of on_submit (which would also swallow the ephemeral
+            # confirmation below).
             try:
-                await interaction.channel.send(embed=rating_embed)
-                posted_publicly = True
-            except discord.HTTPException as err:
+                target_channel = interaction.channel
+                if target_channel is None:
+                    guild = interaction.guild or self.source_interaction.guild
+                    if guild is not None:
+                        target_channel = guild.get_channel(interaction.channel_id) or await guild.fetch_channel(interaction.channel_id)
+                if target_channel is not None:
+                    await target_channel.send(embed=rating_embed)
+                    posted_publicly = True
+                else:
+                    print('Failed to post rating embed: could not resolve a channel to post in.')
+                    post_note = ' (Gagal posting embed rating, tapi rating sudah tersimpan.)'
+            except Exception as err:  # noqa: BLE001
                 print(f'Failed to post rating embed to channel: {err}')
                 post_note = ' (Gagal posting embed rating, tapi rating sudah tersimpan.)'
 
