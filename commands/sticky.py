@@ -2,7 +2,23 @@
 (classic StickyBot-style), and enforce the "reviews only" cleanup in the
 guild's configured product-reviews channel.
 
-New file -- commands/sticky.py
+commands/sticky.py
+
+Restart-safety notes
+---------------------
+Sticky config already lives in Firestore (`stickyMessages` collection), so
+the data itself survives a bot restart with no changes needed. What did NOT
+survive cleanly was *freshness*: if messages were posted in a sticky channel
+while the bot was offline, the sticky wouldn't get bumped back to the bottom
+until the *next* new message arrived after startup -- which could be minutes
+or hours later, leaving the sticky sitting somewhere in the middle of the
+channel in the meantime.
+
+`StickyCog.cog_load` now runs a reconciliation pass on every stored sticky
+config as soon as the cog (re)loads: it checks whether the last message in
+each sticky channel is still the sticky itself, and if not, immediately
+deletes the stale copy and reposts fresh -- exactly like `_handle_restick`
+would do on the next message, just without waiting for one.
 """
 import asyncio
 
@@ -46,6 +62,14 @@ async def get_sticky(channel_id: str):
     return doc.to_dict()
 
 
+async def get_all_stickies() -> list[dict]:
+    """Used at startup to reconcile every sticky channel across every guild
+    the bot is in. Returns the raw doc dicts (each already contains
+    channelId / guildId / content / embed / lastMessageId)."""
+    docs = db.collection('stickyMessages').stream()
+    return [doc.to_dict() for doc in docs]
+
+
 async def save_sticky(channel_id: str, *, guild_id: str, content: str | None, embed_dict: dict | None, last_message_id: str | None):
     db.collection('stickyMessages').document(_sticky_doc_id(channel_id)).set({
         'guildId': guild_id,
@@ -70,6 +94,7 @@ class StickyCog(commands.Cog):
         # Per-channel lock so rapid-fire messages don't race to repost the
         # sticky multiple times.
         self._locks: dict[int, asyncio.Lock] = {}
+        self._reconciled = False
 
     def _lock_for(self, channel_id: int) -> asyncio.Lock:
         if channel_id not in self._locks:
@@ -83,6 +108,107 @@ class StickyCog(commands.Cog):
             await interaction.response.send_message('This command only works inside a server.', ephemeral=True)
             return False
         return True
+
+    # -----------------------------------------------------------------
+    # Startup reconciliation
+    # -----------------------------------------------------------------
+    async def cog_load(self):
+        # Wait until the bot has an active gateway connection so
+        # fetch_channel/fetch_message calls below don't fail during the
+        # brief window right after process start.
+        await self.bot.wait_until_ready()
+        self.bot.loop.create_task(self._reconcile_all_stickies())
+
+    async def _reconcile_all_stickies(self):
+        if self._reconciled:
+            return
+        self._reconciled = True
+
+        try:
+            stickies = await get_all_stickies()
+        except Exception as err:  # noqa: BLE001
+            print(f'[sticky] Failed to load stickies for startup reconciliation: {err}')
+            return
+
+        for sticky in stickies:
+            channel_id = sticky.get('channelId')
+            if not channel_id:
+                continue
+            try:
+                await self._reconcile_one(sticky)
+            except Exception as err:  # noqa: BLE001
+                # Never let one bad channel (deleted channel, missing perms,
+                # etc.) stop the rest of the reconciliation pass.
+                print(f'[sticky] Failed to reconcile sticky for channel {channel_id}: {err}')
+
+    async def _reconcile_one(self, sticky: dict):
+        channel_id = sticky['channelId']
+
+        try:
+            channel = self.bot.get_channel(int(channel_id)) or await self.bot.fetch_channel(int(channel_id))
+        except (discord.NotFound, discord.Forbidden):
+            # Channel gone or bot no longer has access -- drop the stale
+            # config so we don't keep retrying every restart.
+            print(f'[sticky] Channel {channel_id} unreachable, removing stale sticky config.')
+            await delete_sticky(str(channel_id))
+            return
+        except discord.HTTPException as err:
+            print(f'[sticky] HTTP error resolving channel {channel_id}, will retry next restart: {err}')
+            return
+
+        async with self._lock_for(channel.id):
+            # Re-read inside the lock in case /sticky unstick ran between
+            # the initial fetch and now.
+            current = await get_sticky(str(channel.id))
+            if not current:
+                return
+
+            last_message_id = current.get('lastMessageId')
+
+            # Find the actual most recent message in the channel.
+            try:
+                latest = [msg async for msg in channel.history(limit=1)]
+            except discord.HTTPException as err:
+                print(f'[sticky] Failed to read channel history for {channel.id}: {err}')
+                return
+
+            latest_id = str(latest[0].id) if latest else None
+
+            if latest_id is not None and latest_id == str(last_message_id):
+                # Sticky is already the last message -- nothing to do.
+                return
+
+            content = current.get('content')
+            embed_dict = current.get('embed')
+
+            old_message = None
+            if last_message_id:
+                try:
+                    old_message = await channel.fetch_message(int(last_message_id))
+                except discord.HTTPException:
+                    old_message = None
+
+            if old_message is not None:
+                try:
+                    await old_message.delete()
+                except discord.HTTPException as err:
+                    print(f'[sticky] Failed to delete stale sticky in {channel.id} during reconciliation: {err}')
+
+            try:
+                reposted = await channel.send(
+                    content=content,
+                    embed=discord.Embed.from_dict(embed_dict) if embed_dict else None,
+                )
+            except discord.HTTPException as err:
+                print(f'[sticky] Failed to repost sticky in {channel.id} during reconciliation: {err}')
+                return
+
+            try:
+                await update_sticky_last_message(str(channel.id), str(reposted.id))
+            except Exception as err:  # noqa: BLE001
+                print(f'[sticky] Reposted sticky in {channel.id} but failed to persist new lastMessageId: {err}')
+
+            print(f'[sticky] Reconciled sticky in channel {channel.id} after restart.')
 
     @sticky_group.command(name='stick', description='Stick a message to the bottom of this channel')
     @app_commands.describe(messageid='ID of the message to stick (must be in this channel)')
