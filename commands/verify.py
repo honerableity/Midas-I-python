@@ -349,6 +349,13 @@ async def _run_verify_start(interaction: discord.Interaction):
     panel (/verify sendpanel). Panel button interactions don't go through
     the slash-command tree, so this must be self-contained and not assume
     it's a slash command context.
+
+    Every response here is explicitly ephemeral=True. Deferring with
+    ephemeral=True only makes the initial "thinking" state ephemeral --
+    subsequent interaction.followup.send() calls do NOT inherit that and
+    need ephemeral=True passed on each one, or they end up posting publicly
+    in the panel's channel. That matters a lot here specifically, since the
+    whole point of the panel is to keep its channel clean.
     """
     if interaction.guild is None:
         return await interaction.response.send_message('This command only works inside a server.', ephemeral=True)
@@ -357,20 +364,24 @@ async def _run_verify_start(interaction: discord.Interaction):
 
     config = await get_guild_config(str(interaction.guild_id))
     if not config or not config.get('verifiedRoleId'):
-        return await interaction.followup.send("Verify role isn't set up yet. Ask an admin to run `/verify setrole` first.")
+        return await interaction.followup.send(
+            "Verify role isn't set up yet. Ask an admin to run `/verify setrole` first.",
+            ephemeral=True,
+        )
 
     existing_record = await get_verified_user(str(interaction.user.id))
     if existing_record:
-        return await interaction.followup.send('You are already verified!')
+        return await interaction.followup.send('You are already verified!', ephemeral=True)
 
     existing = await get_session(str(interaction.user.id))
     if existing:
         return await interaction.followup.send(
             f"You already have an active verification code. Check your DMs, or wait "
-            f"<t:{int(existing['expiresAt'] / 1000)}:R> for it to expire before starting over."
+            f"<t:{int(existing['expiresAt'] / 1000)}:R> for it to expire before starting over.",
+            ephemeral=True,
         )
 
-    await interaction.followup.send('Check your DMs! 📬')
+    await interaction.followup.send('Check your DMs! 📬', ephemeral=True)
 
     session = await create_session(str(interaction.user.id))
     code, expires_at = session['code'], session['expiresAt']
@@ -443,14 +454,14 @@ class SendVerifyPanelModal(discord.ui.Modal, title='Verify Panel'):
             await self.target_channel.send(embed=embed, view=VerifyPanelView())
         except discord.HTTPException as err:
             print(f'Failed to send verify panel: {err}')
-            return await interaction.followup.send(f"Couldn't send the panel to {self.target_channel.mention}.")
+            return await interaction.followup.send(f"Couldn't send the panel to {self.target_channel.mention}.", ephemeral=True)
 
         await log_command_activity(
             self.source_interaction, subcommand='sendpanel', success=True,
             fields={'discordUser': interaction.user, 'channel': self.target_channel},
         )
 
-        await interaction.followup.send(f'Verify panel sent to {self.target_channel.mention}.')
+        await interaction.followup.send(f'Verify panel sent to {self.target_channel.mention}.', ephemeral=True)
 
 
 class VerifyCog(commands.Cog):
