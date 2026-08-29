@@ -1,6 +1,6 @@
 """Main bot entrypoint.
 
-Ported from index.js. Loads env, boots discord.py Client w/ command tree,
+Loads env, boots discord.py Client w/ command tree,
 loads every commands/*.py as an extension, wires honeypot message listener,
 starts expiry scanner on ready.
 """
@@ -49,11 +49,6 @@ def _discover_command_extensions() -> list[str]:
 
 COMMAND_EXTENSIONS = _discover_command_extensions()
 
-# Slash commands that work without being verified yet. Anything else is
-# blocked with a friendly message via VerificationGatedTree below.
-# "verify setrole" is exempt too, since an admin has to be able to set the
-# verified role *before* anyone can verify -- otherwise no one could ever
-# bootstrap a fresh server.
 UNVERIFIED_ALLOWED = {
     ('verify', 'start'),
     ('verify', 'setrole'),
@@ -108,10 +103,6 @@ async def setup_hook():
     for ext in COMMAND_EXTENSIONS:
         await bot.load_extension(f'commands.{ext}')
 
-    # Always re-sync slash commands on boot -- mirrors index.js's
-    # deployCommands() always-redeploy comment: a stale hash file from a
-    # prior boot can't be manually cleared on some hosts, so redeploying
-    # every boot avoids "unchanged" false positives even after real edits.
     print('Deploying slash commands...')
     try:
         if GUILD_ID:
@@ -121,23 +112,30 @@ async def setup_hook():
         else:
             synced = await bot.tree.sync()
         print(f'Slash commands registered successfully. Discord confirmed {len(synced)} command(s) live.')
-    except Exception as err:  # noqa: BLE001
+    except Exception as err:
         print(f'Auto-deploy failed: {err}')
         print('Bot will still start, but slash commands may be out of date. Run `python deploy_commands.py` manually.')
+
+
+_webhook_runner = None
 
 
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user}')
 
-    # Reverses temp-bans and temp-vcmutes past their expiry. Runs once
-    # immediately (catches anything missed while offline) then every 60s.
     from utils.moderation import start_expiry_scanner
     start_expiry_scanner(bot)
 
+    global _webhook_runner
+    if _webhook_runner is None and os.getenv('WEBHOOK_ENABLED', '1') != '0':
+        from utils.webhook_server import start as start_webhook_server
+        try:
+            _webhook_runner = await start_webhook_server(bot)
+        except Exception as err:
+            print(f'[webhook] Failed to start webhook server (payments still work via polling): {err}')
 
-# Honeypot channel watch -- separate from slash-command handling since this
-# fires on every message, not on interactions.
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -146,7 +144,7 @@ async def on_message(message: discord.Message):
     try:
         from commands.mod import handle_honeypot_message
         await handle_honeypot_message(message)
-    except Exception as err:  # noqa: BLE001
+    except Exception as err:
         print(f'[mod] honeypot handler failed: {err}')
 
     await bot.process_commands(message)
@@ -162,14 +160,13 @@ async def on_app_command_error(interaction: discord.Interaction, error: discord.
         else:
             await interaction.response.send_message('Bot error occurred.', ephemeral=True)
     except discord.HTTPException as reply_err:
-        # Interaction likely expired (>3s) or was already acknowledged elsewhere.
         print(f'Could not send error reply (interaction likely expired): {reply_err}')
 
 
 def main():
     try:
         bot.run(TOKEN)
-    except Exception as err:  # noqa: BLE001
+    except Exception as err:
         print(f'Unhandled error: {err}')
 
 
