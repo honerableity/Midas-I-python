@@ -98,16 +98,22 @@ def _parse_price_local(price_str) -> int:
     return int(digits) if digits else 0
 
 
-def _render_qris_image(qris_string: str, order_id: str) -> discord.File:
-    """Renders the QRIS payload as a PNG locally (never via a third-party
-    image URL -- the QRIS string carries live payment routing data)."""
+def _decode_qr_image(qr_image_data_uri: str, order_id: str) -> discord.File:
+    """Decodes the base64 QR PNG that ARTAN SHOP returns directly from
+    payment/create (data:image/png;base64,...). We never fetch a
+    third-party image URL for this -- the payload came straight from our
+    own server-to-server call to the gateway, not from anything a user
+    could redirect.
+    """
+    import base64
     import io
-    import qrcode
 
-    img = qrcode.make(qris_string or '')
-    buf = io.BytesIO()
-    img.save(buf, format='PNG')
-    buf.seek(0)
+    raw = qr_image_data_uri or ''
+    if ',' in raw:
+        raw = raw.split(',', 1)[1]
+
+    img_bytes = base64.b64decode(raw) if raw else b''
+    buf = io.BytesIO(img_bytes)
     safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', order_id)[:60]
     return discord.File(buf, filename=f'qris_{safe_name}.png')
 
@@ -836,7 +842,7 @@ _LIVE_QRIS_VIEWS: dict[str, 'QRISPaymentView'] = {}
 
 
 async def notify_order_paid(bot: commands.Bot, order_id: str, order: dict):
-    """Called by utils/webhook_server when Pakasir's webhook confirms a
+    """Called by utils/webhook_server when the payment gateway's webhook confirms a
     payment. Delivers immediately if we still have the live view for this
     order in memory; otherwise this is a no-op and the view's own polling
     loop (or a fresh /product buy poll after a restart) will pick it up.
@@ -1289,7 +1295,7 @@ class ProductCog(commands.Cog):
             )
 
         if not pakasir_configured():
-            return await interaction.followup.send('Payment gateway is not configured yet. Ask an admin to set `PAKASIR_PROJECT` / `PAKASIR_API_KEY`.')
+            return await interaction.followup.send('Payment gateway is not configured yet. Ask an admin to set `TOKOSHOPP_API_KEY`.')
 
         existing_order = await find_pending_order_for_channel(str(interaction.channel_id))
         if existing_order:
@@ -1321,11 +1327,11 @@ class ProductCog(commands.Cog):
             await log_command_activity(
                 interaction, subcommand='buy', success=False,
                 fields={'discordUser': interaction.user, 'productId': product['id'], 'productName': product['name']},
-                note='Pakasir transactioncreate failed.',
+                note='ARTAN SHOP payment/create failed.',
             )
             return await interaction.followup.send('Failed to generate a QRIS payment. Please try again in a moment.')
 
-        qr_file = _render_qris_image(order['qrisString'], order['orderId'])
+        qr_file = _decode_qr_image(order['qrImageDataUri'], order['orderId'])
 
         embed = discord.Embed(title=f"Pay for {product['name']}", color=0x00B0F4)
         embed.add_field(name='Total', value=_format_idr_local(amount), inline=True)
