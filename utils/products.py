@@ -1,7 +1,4 @@
-"""Product catalog helpers: types, forums, ownership, delivery DM.
-
-Ported from utils/products.js.
-"""
+"""Product catalog helpers: types, forums, ownership, delivery DM."""
 import re
 import time
 
@@ -56,7 +53,6 @@ async def resolve_product_category(guild: discord.Guild, guild_id: str):
                 existing = None
         if existing:
             return existing
-        # Stored id is stale (category deleted manually) -- fall through and create a new one.
 
     category = await guild.create_category('Bot Products')
     await save_product_category(guild_id, str(category.id))
@@ -127,7 +123,6 @@ async def create_or_sync_product_type_forum(guild: discord.Guild, guild_id: str,
         if existing_channel:
             await existing_channel.edit(overwrites=overwrites)
             return {'type': existing_type, 'forumChannel': existing_channel, 'created': False}
-        # Stored channel id is stale -- fall through and create a fresh one.
 
     forum_channel = await guild.create_forum(
         slugify_channel_name(type_name),
@@ -212,6 +207,31 @@ async def delete_product(product_id: str):
     db.collection('products').document(product_id).delete()
 
 
+async def bump_product_version(product_id: str, changelog: str, updated_by: str) -> int:
+    """Increments a product's version counter and appends a changelog entry.
+    Does NOT touch stock/fileLink -- that's what /product setstock is for.
+    Returns the new version number.
+    """
+    product = await get_product(product_id)
+    if not product:
+        raise ValueError('Product not found')
+
+    new_version = product_version(product) + 1
+    entry = {
+        'version': new_version,
+        'changelog': changelog,
+        'updatedBy': updated_by,
+        'updatedAt': _now_ms(),
+    }
+    history = list(product.get('versionHistory') or [])
+    history.append(entry)
+
+    db.collection('products').document(product_id).set(
+        {'version': new_version, 'versionHistory': history}, merge=True
+    )
+    return new_version
+
+
 def user_owns_product(product: dict, discord_id: str) -> bool:
     owners = product.get('owners')
     return isinstance(owners, list) and discord_id in owners
@@ -258,15 +278,138 @@ async def get_products_by_ids(product_ids: list[str]):
     return [{'id': doc.id, **doc.to_dict()} for doc in docs if doc.exists]
 
 
-# ---------------------------------------------------------------------------
-# Whitelisting for the Vercel /api/validate endpoint used by Roblox Studio /
-# in-game HttpService. Access is granted by EITHER:
-#   - plain ownership (products/{id}.owners, see user_owns_product above) --
-#     grants use in ANY place, no place-scoping at all
-#   - productGroupWhitelists/{productId}_{groupId} -> product usable by any
-#     verified user who has linked that group AND is still a member of it,
-#     restricted to that group's own places
-# ---------------------------------------------------------------------------
+
+def _stock_pool(product: dict) -> list[dict]:
+    pool = product.get('stockPool')
+    if pool:
+        return pool
+    legacy_link = product.get('fileLink')
+    if legacy_link:
+        return [{'fileLink': legacy_link, 'remaining': -1}]
+    return []
+
+
+def product_version(product: dict) -> int:
+    return int(product.get('version') or 1)
+
+
+def total_stock(product: dict) -> int | None:
+    """Sum of remaining units across all batches, or None if any batch is
+    infinite (there's then no meaningful finite total).
+    """
+    pool = _stock_pool(product)
+    if not pool:
+        return 0
+    total = 0
+    for batch in pool:
+        remaining = batch.get('remaining', 0)
+        if remaining == -1:
+            return None
+        total += max(0, remaining)
+    return total
+
+
+def stock_summary_text(product: dict) -> str:
+    """Human-readable stock line for embeds, e.g. '23 tersedia (2 varian)'
+    or 'Stok tidak terbatas'.
+    """
+    pool = _stock_pool(product)
+    if not pool:
+        return 'Habis'
+    if any(b.get('remaining') == -1 for b in pool):
+        return 'Stok tidak terbatas'
+    total = total_stock(product) or 0
+    if total <= 0:
+        return 'Habis'
+    variant_note = f' ({len(pool)} varian)' if len(pool) > 1 else ''
+    return f'{total} tersedia{variant_note}'
+
+
+def is_in_stock(product: dict) -> bool:
+    pool = _stock_pool(product)
+    if not pool:
+        return False
+    if any(b.get('remaining') == -1 for b in pool):
+        return True
+    return (total_stock(product) or 0) > 0
+
+
+async def add_stock_batch(product_id: str, file_link: str, quantity: int | None):
+    """Appends a new batch to the product's stock pool. quantity=None means
+    infinite (remaining=-1). Reads-modifies-writes rather than using
+    ArrayUnion so total_stock() sees a consistent pool immediately after.
+    """
+    product = await get_product(product_id)
+    if not product:
+        raise ValueError('Product not found')
+
+    pool = list(_stock_pool(product))
+    pool.append({
+        'fileLink': file_link,
+        'remaining': -1 if quantity is None else max(0, quantity),
+        'addedAt': _now_ms(),
+    })
+    db.collection('products').document(product_id).set(
+        {'stockPool': pool, 'fileLink': file_link}, merge=True
+    )
+    return pool
+
+
+def _pick_batch_index(pool: list[dict]) -> int | None:
+    """Picks a random in-stock batch index, weighted so every unit of stock
+    (not every batch) has an equal chance -- an infinite batch always wins
+    since it never runs out, matching "unlimited stock" semantics.
+    """
+    import random
+
+    infinite_indices = [i for i, b in enumerate(pool) if b.get('remaining') == -1]
+    if infinite_indices:
+        return random.choice(infinite_indices)
+
+    weighted = [(i, b.get('remaining', 0)) for i, b in enumerate(pool) if b.get('remaining', 0) > 0]
+    if not weighted:
+        return None
+    total = sum(w for _, w in weighted)
+    r = random.randint(1, total)
+    upto = 0
+    for i, w in weighted:
+        upto += w
+        if r <= upto:
+            return i
+    return weighted[-1][0]
+
+
+async def draw_stock_unit(product_id: str) -> str | None:
+    """Atomically claims one unit of stock and returns its fileLink, or
+    None if nothing is left. Runs as a Firestore transaction so two buyers
+    can't both be handed the last unit of a finite batch.
+    """
+    from google.cloud.firestore_v1.transaction import Transaction, transactional
+
+    ref = db.collection('products').document(product_id)
+
+    @transactional
+    def _txn(transaction: Transaction):
+        snap = ref.get(transaction=transaction)
+        if not snap.exists:
+            return None
+        product = {'id': snap.id, **snap.to_dict()}
+        pool = list(_stock_pool(product))
+        idx = _pick_batch_index(pool)
+        if idx is None:
+            return None
+
+        chosen_link = pool[idx]['fileLink']
+        if pool[idx].get('remaining', -1) != -1:
+            pool[idx] = {**pool[idx], 'remaining': pool[idx]['remaining'] - 1}
+
+        transaction.set(ref, {'stockPool': pool}, merge=True)
+        return chosen_link
+
+    transaction = db.transaction()
+    return _txn(transaction)
+
+
 
 def _group_whitelist_doc_id(product_id: str, group_id: str) -> str:
     return f'{product_id}_{group_id}'
@@ -291,9 +434,6 @@ async def add_group_whitelist(product_id: str, group_id: str, *, auto_granted: b
         'createdAt': _now_ms(),
     }
     if auto_granted:
-        # Only set autoGranted=True if the doc doesn't already exist as a
-        # manual admin grant -- an auto-grant should never downgrade or
-        # relabel a grant an admin explicitly made.
         existing = doc_ref.get()
         if not existing.exists:
             data['autoGranted'] = True
@@ -348,17 +488,24 @@ async def auto_revoke_product_for_user(product_id: str, discord_id: str):
 _URL_RE = re.compile(r'^https?://', re.IGNORECASE)
 
 
-def build_product_delivery_dm(product: dict):
+def build_product_delivery_dm(product: dict, file_link: str | None = None):
     """Builds the DM payload used to deliver a purchased/owned product to a
     user. Returns kwargs suitable for `discord.abc.Messageable.send(**kwargs)`.
+
+    file_link overrides which link is sent -- used when the product has a
+    stock pool with several batches (see draw_stock_unit above) so the
+    buyer gets the specific unit that was drawn for them, not just
+    whatever the top-level fileLink field happens to hold.
     """
     embed = discord.Embed(
         title=product['name'],
         color=0x00B0F4,
         description='Here is your product, click the button below to download the file.',
     )
+    if product.get('version'):
+        embed.set_footer(text=f"v{product['version']}")
 
-    file_link = product.get('fileLink', '') or ''
+    file_link = file_link if file_link is not None else (product.get('fileLink', '') or '')
     button_ok = bool(_URL_RE.match(file_link))
 
     if product.get('tutorialLink'):
@@ -369,7 +516,6 @@ def build_product_delivery_dm(product: dict):
         view = discord.ui.View()
         view.add_item(discord.ui.Button(label='Download', style=discord.ButtonStyle.link, url=file_link))
     else:
-        # fileLink wasn't a valid URL for a Link button -- show it as text.
         embed.add_field(name='Link File', value=file_link, inline=False)
 
     return {'embed': embed, 'view': view}
@@ -381,7 +527,7 @@ def build_rating_embed(product: dict, rating: int, reason: str, reviewer_name: s
     from the main sendpost listing embed. Always names the product being
     reviewed so the embed makes sense on its own, wherever it lands.
     """
-    from utils.reviews import stars_bar  # local import: avoid module cycle at import time
+    from utils.reviews import stars_bar
 
     color = 0x57F287 if rating >= 7 else (0xFEE75C if rating >= 4 else 0xED4245)
     embed = discord.Embed(
