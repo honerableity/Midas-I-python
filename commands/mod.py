@@ -1,6 +1,4 @@
 """/mod command -- moderation actions.
-
-Ported from commands/mod.js.
 """
 import datetime
 import time
