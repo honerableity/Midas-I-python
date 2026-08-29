@@ -1,19 +1,20 @@
 """Payment gateway integration for /product buy.
 
-Currently wraps Pakasir (https://pakasir.com/p/docs) behind a small
-gateway-agnostic interface so a second provider (e.g. an Indonesian
-gateway like tokoshopp.web.id) can be dropped in later without touching
-commands/product.py or commands/ticket.py.
+Wraps tokoshopp.web.id (ARTAN SHOP), https://tokoshopp.web.id/api-docs.html.
+
+This provider is new and unverified compared to more established options --
+start with small real transactions and watch a handful of them complete
+before relying on it for volume. confirm_payment() below never trusts a
+webhook body by itself; it always re-queries the provider's own Check
+Status endpoint first.
 
 Env vars required:
-    PAKASIR_PROJECT   -- project slug from the Pakasir dashboard
-    PAKASIR_API_KEY   -- API key from the Pakasir project's detail page
+    TOKOSHOPP_API_KEY -- API key from the ARTAN SHOP dashboard's API Key menu
 
-Order id convention: we always use the Discord order document id
-("orders/{orderId}" in Firestore) as Pakasir's order_id, and the order's
-locked total (in whole Rupiah, no decimals) as amount. Pakasir keys a
-transaction by the (project, order_id, amount) triple, so both must be
-sent back unchanged on every lookup/cancel call.
+Unlike some gateways, ARTAN SHOP's Check Status endpoint is keyed by
+*their* transaction_id, not the order_id we chose -- so we store their
+transaction_id on our own order record the moment Create Payment returns
+it, and use that for every later lookup.
 """
 import os
 import time
@@ -22,9 +23,8 @@ import aiohttp
 
 from utils.firebase import db
 
-PAKASIR_BASE = 'https://app.pakasir.com'
-PAKASIR_PROJECT = os.getenv('PAKASIR_PROJECT')
-PAKASIR_API_KEY = os.getenv('PAKASIR_API_KEY')
+TOKOSHOPP_BASE = 'https://tokoshopp.web.id'
+TOKOSHOPP_API_KEY = os.getenv('TOKOSHOPP_API_KEY')
 
 ORDER_EXPIRY_MS = 30 * 60 * 1000
 
@@ -38,74 +38,63 @@ def _now_ms():
 
 
 def pakasir_configured() -> bool:
-    return bool(PAKASIR_PROJECT and PAKASIR_API_KEY)
+    """Name kept for compatibility with commands/product.py and
+    utils/webhook_server.py -- despite the name, this now reports whether
+    the active gateway (tokoshopp/ARTAN SHOP) is configured.
+    """
+    return bool(TOKOSHOPP_API_KEY)
 
+
+def _headers() -> dict:
+    return {'Content-Type': 'application/json', 'x-api-key': TOKOSHOPP_API_KEY or ''}
 
 
 async def create_qris_payment(order_id: str, amount: int) -> dict:
-    """Creates a QRIS transaction on Pakasir. Returns the raw `payment` dict:
-    {project, order_id, amount, fee, total_payment, payment_method,
-     payment_number (the QRIS string), expired_at}.
+    """Creates a QRIS transaction on ARTAN SHOP. Returns the raw response
+    dict: {success, transaction_id, status, qr_image (base64 PNG data URI)}.
     """
     if not pakasir_configured():
-        raise PaymentGatewayError('PAKASIR_PROJECT / PAKASIR_API_KEY not configured.')
+        raise PaymentGatewayError('TOKOSHOPP_API_KEY not configured.')
 
-    url = f'{PAKASIR_BASE}/api/transactioncreate/qris'
-    body = {
-        'project': PAKASIR_PROJECT,
-        'order_id': order_id,
-        'amount': amount,
-        'api_key': PAKASIR_API_KEY,
-    }
+    url = f'{TOKOSHOPP_BASE}/api/payment/create'
+    body = {'amount': amount, 'order_id': order_id}
     async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=body) as resp:
+        async with session.post(url, json=body, headers=_headers()) as resp:
             data = await resp.json(content_type=None)
-            if resp.status != 200 or 'payment' not in data:
-                raise PaymentGatewayError(f'Pakasir transactioncreate failed ({resp.status}): {data}')
-            return data['payment']
+            if resp.status != 200 or not data.get('success'):
+                raise PaymentGatewayError(f'ARTAN SHOP payment/create failed ({resp.status}): {data}')
+            return data
 
 
-async def get_transaction_status(order_id: str, amount: int) -> dict | None:
-    """Polls Pakasir directly for a transaction's true status -- used both
-    as a fallback if the webhook never arrives and to double-check every
-    webhook payload before trusting it (Pakasir's own docs recommend this;
-    webhook bodies alone aren't signed, so treat them as a hint, not proof).
-    Returns the `transaction` dict, or None if not found yet.
+async def get_transaction_status(transaction_id: str) -> dict | None:
+    """Polls ARTAN SHOP directly for a transaction's true status -- used
+    both as a fallback if the webhook never arrives and to double-check
+    every webhook payload before trusting it. Returns the response dict,
+    or None if not found yet.
     """
     if not pakasir_configured():
-        raise PaymentGatewayError('PAKASIR_PROJECT / PAKASIR_API_KEY not configured.')
+        raise PaymentGatewayError('TOKOSHOPP_API_KEY not configured.')
 
-    url = (
-        f'{PAKASIR_BASE}/api/transactiondetail'
-        f'?project={PAKASIR_PROJECT}&amount={amount}&order_id={order_id}&api_key={PAKASIR_API_KEY}'
-    )
+    url = f'{TOKOSHOPP_BASE}/api/payment/status'
+    body = {'transaction_id': transaction_id}
     async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
+        async with session.post(url, json=body, headers=_headers()) as resp:
             if resp.status == 404:
                 return None
             data = await resp.json(content_type=None)
-            if resp.status != 200 or 'transaction' not in data:
-                raise PaymentGatewayError(f'Pakasir transactiondetail failed ({resp.status}): {data}')
-            return data['transaction']
+            if resp.status != 200 or not data.get('success'):
+                if resp.status == 404:
+                    return None
+                raise PaymentGatewayError(f'ARTAN SHOP payment/status failed ({resp.status}): {data}')
+            return data
 
 
 async def cancel_transaction(order_id: str, amount: int) -> None:
-    if not pakasir_configured():
-        return
-    url = f'{PAKASIR_BASE}/api/transactioncancel'
-    body = {
-        'project': PAKASIR_PROJECT,
-        'order_id': order_id,
-        'amount': amount,
-        'api_key': PAKASIR_API_KEY,
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=body):
-                pass
-    except Exception as err:
-        print(f'[payments] transactioncancel failed for {order_id}: {err}')
-
+    """ARTAN SHOP's docs don't expose a cancel endpoint -- transactions
+    just expire on their own. Kept as a no-op so callers (and any future
+    admin tooling) don't need a gateway-specific branch.
+    """
+    return None
 
 
 async def create_payment_order(*, guild_id: str, channel_id: str, buyer_id: str,
@@ -115,17 +104,18 @@ async def create_payment_order(*, guild_id: str, channel_id: str, buyer_id: str,
 
     record = {
         'orderId': order_id,
+        'gatewayTransactionId': payment.get('transaction_id'),
         'guildId': guild_id,
         'channelId': channel_id,
         'buyerId': buyer_id,
         'productId': product_id,
         'productName': product_name,
         'amount': amount,
-        'gateway': 'pakasir',
+        'gateway': 'tokoshopp',
         'status': 'pending',
-        'qrisString': payment.get('payment_number'),
-        'expiredAt': payment.get('expired_at'),
+        'qrImageDataUri': payment.get('qr_image'),
         'createdAt': _now_ms(),
+        'expiredAt': _now_ms() + ORDER_EXPIRY_MS,
     }
     db.collection('paymentOrders').document(order_id).set(record)
     return record
@@ -136,6 +126,21 @@ async def get_payment_order(order_id: str) -> dict | None:
     if not doc.exists:
         return None
     return {'id': doc.id, **doc.to_dict()}
+
+
+async def find_order_by_gateway_transaction_id(transaction_id: str) -> dict | None:
+    """Used by the webhook handler, whose payload only carries ARTAN
+    SHOP's transaction_id, not our own order_id.
+    """
+    query = (
+        db.collection('paymentOrders')
+        .where('gatewayTransactionId', '==', transaction_id)
+        .limit(1)
+    )
+    docs = list(query.stream())
+    if not docs:
+        return None
+    return {'id': docs[0].id, **docs[0].to_dict()}
 
 
 async def find_pending_order_for_channel(channel_id: str) -> dict | None:
@@ -163,15 +168,19 @@ async def mark_order_status(order_id: str, status: str):
 
 async def confirm_payment(order_id: str) -> dict | None:
     """Double-checks a webhook (or a manual /product buy status poll)
-    directly against Pakasir before treating a payment as real. Returns
+    directly against ARTAN SHOP before treating a payment as real. Returns
     the updated order record if it just got confirmed, else None.
     """
     order = await get_payment_order(order_id)
     if not order or order['status'] != 'pending':
         return None
 
-    txn = await get_transaction_status(order_id, order['amount'])
-    if not txn or txn.get('status') != 'completed':
+    transaction_id = order.get('gatewayTransactionId')
+    if not transaction_id:
+        return None
+
+    txn = await get_transaction_status(transaction_id)
+    if not txn or txn.get('status') != 'paid':
         return None
 
     if int(txn.get('amount', -1)) != int(order['amount']):
