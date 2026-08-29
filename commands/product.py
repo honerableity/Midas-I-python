@@ -1,7 +1,5 @@
-"""/product command -- manage shop products.
-
-Ported from commands/product.js.
-"""
+"""/product command -- manage shop products."""
+import asyncio
 import re
 import time
 import uuid
@@ -13,20 +11,25 @@ from discord.ext import commands
 from utils.logger import log_command_activity
 from utils.products import (
     add_group_whitelist,
+    add_stock_batch,
     auto_revoke_product_for_user,
     auto_whitelist_product_for_user,
+    bump_product_version,
     create_or_sync_product_type_forum,
     delete_product,
     get_product,
     get_products_by_ids,
     give_product_to_user,
+    is_in_stock,
     link_existing_forum_to_type,
     list_product_types,
     list_products_by_guild,
     list_products_by_type,
+    product_version,
     remove_group_whitelist,
     revoke_product_from_user,
     save_product,
+    stock_summary_text,
     user_owns_product,
     build_product_delivery_dm,
     build_rating_embed,
@@ -34,6 +37,15 @@ from utils.products import (
 from utils.reviews import RATING_MAX, RATING_MIN, get_testimony_count, set_testimony_count, submit_review
 from utils.reviews_channel import get_reviews_channel, save_reviews_channel, save_reviews_mod_role
 from utils.verification import get_verified_user
+from utils.tickets import get_ticket
+from utils.payments import (
+    PaymentGatewayError,
+    confirm_payment,
+    create_payment_order,
+    find_pending_order_for_channel,
+    mark_order_status,
+    pakasir_configured,
+)
 
 COMMAND_NAME = 'product'
 
@@ -44,6 +56,9 @@ LOG_SCHEMA = {
         'linktype': {'label': 'Product — Type Linked', 'fields': ['discordUser', 'typeName', 'forumChannel']},
         'sendpost': {'label': 'Product — Post Sent', 'fields': ['discordUser', 'productId', 'forumChannel']},
         'edit': {'label': 'Product — Edited', 'fields': ['discordUser', 'productId', 'productName']},
+        'update': {'label': 'Product — Version Updated', 'fields': ['discordUser', 'productId', 'productName', 'version']},
+        'setstock': {'label': 'Product — Stock Added', 'fields': ['discordUser', 'productId', 'productName', 'quantity']},
+        'buy': {'label': 'Product — QRIS Payment Created', 'fields': ['discordUser', 'productId', 'productName']},
         'view': {'label': 'Product — Browsed', 'fields': ['discordUser']},
         'delete': {'label': 'Product — Deleted', 'fields': ['discordUser', 'productId', 'productName']},
         'give': {'label': 'Product — Given', 'fields': ['discordUser', 'targetUser', 'productId', 'productName']},
@@ -61,6 +76,9 @@ STEP_TIMEOUT_S = 15 * 60
 MAX_SELECT_OPTIONS = 25
 _IMAGE_URL_RE = re.compile(r'\.(png|jpe?g|gif|webp)(\?.*)?$', re.IGNORECASE)
 _URL_RE = re.compile(r'^https?://', re.IGNORECASE)
+_DIGITS_RE = re.compile(r'[^0-9]')
+QRIS_POLL_INTERVAL_S = 5
+QRIS_POLL_TIMEOUT_S = 30 * 60
 
 
 def _now_ms():
@@ -69,6 +87,29 @@ def _now_ms():
 
 def _require_admin(interaction: discord.Interaction) -> bool:
     return bool(interaction.user.guild_permissions.administrator)
+
+
+def _format_idr_local(n) -> str:
+    return f'Rp{int(n):,}'.replace(',', '.')
+
+
+def _parse_price_local(price_str) -> int:
+    digits = _DIGITS_RE.sub('', str(price_str or ''))
+    return int(digits) if digits else 0
+
+
+def _render_qris_image(qris_string: str, order_id: str) -> discord.File:
+    """Renders the QRIS payload as a PNG locally (never via a third-party
+    image URL -- the QRIS string carries live payment routing data)."""
+    import io
+    import qrcode
+
+    img = qrcode.make(qris_string or '')
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    buf.seek(0)
+    safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', order_id)[:60]
+    return discord.File(buf, filename=f'qris_{safe_name}.png')
 
 
 def _is_free_product(price) -> bool:
@@ -80,9 +121,6 @@ async def _admin_denied(interaction: discord.Interaction):
     await interaction.response.send_message('You need **Administrator** permission to do that.', ephemeral=True)
 
 
-# ---------------------------------------------------------------------------
-# /product create -- modal(1/2) -> continue button -> modal(2/2) -> type select
-# ---------------------------------------------------------------------------
 class CreateModal1(discord.ui.Modal, title='New Product (1/2)'):
     product_name = discord.ui.TextInput(label='Nama produk', style=discord.TextStyle.short, required=True)
     product_description = discord.ui.TextInput(label='Deskripsi', style=discord.TextStyle.paragraph, required=True)
@@ -172,7 +210,7 @@ class CreateModal2(discord.ui.Modal, title='New Product (2/2)'):
 
             try:
                 await select_interaction.response.defer_update() if hasattr(select_interaction.response, 'defer_update') else await select_interaction.response.defer()
-            except Exception as err:  # noqa: BLE001
+            except Exception as err:
                 print(f'select deferred failed (continuing anyway): {err}')
 
             product_id = str(uuid.uuid4())
@@ -195,7 +233,7 @@ class CreateModal2(discord.ui.Modal, title='New Product (2/2)'):
 
             try:
                 await save_product(product_id, product_data)
-            except Exception as err:  # noqa: BLE001
+            except Exception as err:
                 print(f'Failed to save product to Firestore: {err}')
                 await log_command_activity(
                     self.source_interaction, subcommand='create', success=False,
@@ -222,9 +260,6 @@ class CreateModal2(discord.ui.Modal, title='New Product (2/2)'):
         await interaction.followup.send('Terakhir, pilih jenis produk:', view=view)
 
 
-# ---------------------------------------------------------------------------
-# /product edit -- prefilled modal(1/2) -> continue -> modal(2/2) -> type select/keep
-# ---------------------------------------------------------------------------
 class EditModal1(discord.ui.Modal, title='Edit Product (1/2)'):
     def __init__(self, source_interaction: discord.Interaction, product: dict, product_id: str):
         super().__init__()
@@ -327,7 +362,7 @@ class EditModal2(discord.ui.Modal, title='Edit Product (2/2)'):
 
             try:
                 await select_interaction.response.defer()
-            except Exception as err:  # noqa: BLE001
+            except Exception as err:
                 print(f'ack deferred failed (continuing anyway): {err}')
 
             updated_data = {
@@ -353,7 +388,7 @@ class EditModal2(discord.ui.Modal, title='Edit Product (2/2)'):
 
             try:
                 await save_product(self.product_id, updated_data)
-            except Exception as err:  # noqa: BLE001
+            except Exception as err:
                 print(f'Failed to save edited product to Firestore: {err}')
                 await log_command_activity(
                     self.source_interaction, subcommand='edit', success=False,
@@ -392,9 +427,110 @@ class EditModal2(discord.ui.Modal, title='Edit Product (2/2)'):
         )
 
 
-# ---------------------------------------------------------------------------
-# /product delete -- confirm-via-modal
-# ---------------------------------------------------------------------------
+class UpdateModal(discord.ui.Modal, title='Update Product Version'):
+    changelog = discord.ui.TextInput(
+        label='Apa yang berubah?', style=discord.TextStyle.paragraph,
+        placeholder='cth: Perbaikan bug, fitur baru ditambahkan, dll', required=True,
+    )
+
+    def __init__(self, source_interaction: discord.Interaction, product: dict, product_id: str):
+        super().__init__()
+        self.source_interaction = source_interaction
+        self.product = product
+        self.product_id = product_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        changelog_text = self.changelog.value.strip()
+
+        try:
+            new_version = await bump_product_version(self.product_id, changelog_text, str(interaction.user.id))
+        except Exception as err:
+            print(f'bump_product_version failed: {err}')
+            await log_command_activity(
+                self.source_interaction, subcommand='update', success=False,
+                fields={'discordUser': interaction.user, 'productId': self.product_id, 'productName': self.product.get('name')},
+                note='Firestore write failed.',
+            )
+            return await interaction.followup.send('Gagal menaikkan versi produk. Coba lagi.')
+
+        await log_command_activity(
+            self.source_interaction, subcommand='update', success=True,
+            fields={
+                'discordUser': interaction.user, 'productId': self.product_id,
+                'productName': self.product.get('name'), 'version': new_version,
+            },
+        )
+
+        embed = discord.Embed(title=f"{self.product['name']} diperbarui ke v{new_version}", color=0x57F287)
+        embed.add_field(name='Perubahan', value=changelog_text, inline=False)
+        embed.set_footer(text='Stok & link file TIDAK berubah -- pakai /product setstock kalau perlu ganti/tambah link.')
+
+        await interaction.followup.send(embed=embed)
+
+
+class SetStockModal(discord.ui.Modal, title='Set / Add Stock'):
+    stock_link = discord.ui.TextInput(
+        label='Link file (untuk batch stok ini)', style=discord.TextStyle.short,
+        placeholder='CDN Discord, catbox.moe, Drive, Mega.nz, dll', required=True,
+    )
+    stock_quantity = discord.ui.TextInput(
+        label='Jumlah stok', style=discord.TextStyle.short,
+        placeholder='cth: 20, atau ketik "infinite" / "unlimited"', required=True,
+    )
+
+    def __init__(self, source_interaction: discord.Interaction, product: dict, product_id: str):
+        super().__init__()
+        self.source_interaction = source_interaction
+        self.product = product
+        self.product_id = product_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        file_link = self.stock_link.value.strip()
+        quantity_raw = self.stock_quantity.value.strip().lower()
+
+        if quantity_raw in ('infinite', 'unlimited', 'inf', 'tak terbatas', 'unlimited stock', '-1'):
+            quantity = None
+        else:
+            digits = re.sub(r'[^0-9]', '', quantity_raw)
+            if not digits or int(digits) <= 0:
+                return await interaction.followup.send(
+                    'Jumlah stok harus angka positif, atau ketik "infinite" untuk stok tak terbatas.'
+                )
+            quantity = int(digits)
+
+        try:
+            pool = await add_stock_batch(self.product_id, file_link, quantity)
+        except Exception as err:
+            print(f'add_stock_batch failed: {err}')
+            await log_command_activity(
+                self.source_interaction, subcommand='setstock', success=False,
+                fields={'discordUser': interaction.user, 'productId': self.product_id, 'productName': self.product.get('name')},
+                note='Firestore write failed.',
+            )
+            return await interaction.followup.send('Gagal menyimpan stok. Coba lagi.')
+
+        await log_command_activity(
+            self.source_interaction, subcommand='setstock', success=True,
+            fields={
+                'discordUser': interaction.user, 'productId': self.product_id,
+                'productName': self.product.get('name'),
+                'quantity': 'infinite' if quantity is None else quantity,
+            },
+        )
+
+        qty_text = 'Tidak terbatas' if quantity is None else str(quantity)
+        embed = discord.Embed(title=f"Stok ditambahkan: {self.product['name']}", color=0x57F287)
+        embed.add_field(name='Batch baru', value=f'{qty_text} unit', inline=True)
+        embed.add_field(name='Total batch aktif', value=str(len(pool)), inline=True)
+        embed.set_footer(text='Setiap batch bisa punya link file berbeda -- pembeli akan mendapat salah satu link secara acak.')
+
+        await interaction.followup.send(embed=embed)
+
+
 class DeleteConfirmModal(discord.ui.Modal, title='Confirm Delete'):
     def __init__(self, source_interaction: discord.Interaction, product_id: str):
         super().__init__()
@@ -434,12 +570,12 @@ class DeleteConfirmModal(discord.ui.Modal, title='Confirm Delete'):
                         thread = await guild.fetch_channel(int(product['forumThreadId']))
                     if thread:
                         await thread.delete()
-            except Exception as err:  # noqa: BLE001
+            except Exception as err:
                 print(f'Failed to delete forum thread during product delete (continuing anyway): {err}')
 
         try:
             await delete_product(self.product_id)
-        except Exception as err:  # noqa: BLE001
+        except Exception as err:
             print(f'Failed to delete product from Firestore: {err}')
             await log_command_activity(
                 self.source_interaction, subcommand='delete', success=False,
@@ -456,9 +592,6 @@ class DeleteConfirmModal(discord.ui.Modal, title='Confirm Delete'):
         return await interaction.followup.send(f"Produk **{product['name']}** (`{self.product_id}`) berhasil dihapus.")
 
 
-# ---------------------------------------------------------------------------
-# /product rating -- modal(score + reason) -> save review -> post PUBLIC embed
-# ---------------------------------------------------------------------------
 class RatingModal(discord.ui.Modal, title='Rate this product'):
     rating_input = discord.ui.TextInput(
         label=f'Rating ({RATING_MIN}-{RATING_MAX})', placeholder='e.g. 9', style=discord.TextStyle.short,
@@ -493,7 +626,7 @@ class RatingModal(discord.ui.Modal, title='Rate this product'):
                 self.product_id, str(interaction.user.id), interaction.user.name, rating, reason,
                 ticket_channel_id=self.ticket_channel_id,
             )
-        except Exception as err:  # noqa: BLE001
+        except Exception as err:
             print(f'Failed to save review to Firestore: {err}')
             await log_command_activity(
                 self.source_interaction, subcommand='rating', success=False,
@@ -502,28 +635,21 @@ class RatingModal(discord.ui.Modal, title='Rate this product'):
             )
             return await interaction.followup.send('Gagal menyimpan rating ke database. Coba lagi.', ephemeral=True)
 
-        # Build the public-facing review embed once, then decide where it goes.
         rating_embed = build_rating_embed(self.product, rating, reason, interaction.user.name)
 
         post_note = ''
         posted_publicly = False
         guild = interaction.guild or self.source_interaction.guild
 
-        # Preferred destination: the guild's dedicated reviews channel, set
-        # via /product setreviewschannel. This is a plain text channel (not
-        # a forum) that everyone can see, so reviews are visible to everyone
-        # regardless of which product/forum they belong to.
         if guild is not None:
             try:
                 reviews_channel = await get_reviews_channel(guild, str(guild.id))
                 if reviews_channel is not None:
                     await reviews_channel.send(embed=rating_embed)
                     posted_publicly = True
-            except Exception as err:  # noqa: BLE001
+            except Exception as err:
                 print(f'Failed to post rating to configured reviews channel: {err}')
 
-        # Fallback 1: the product's own forum thread, if it has one and the
-        # reviews channel isn't configured (or posting to it failed).
         if not posted_publicly:
             forum_id = self.product.get('typeForumId')
             thread_id = self.product.get('forumThreadId')
@@ -535,17 +661,9 @@ class RatingModal(discord.ui.Modal, title='Rate this product'):
                     if thread:
                         await thread.send(embed=rating_embed)
                         posted_publicly = True
-                except Exception as err:  # noqa: BLE001
+                except Exception as err:
                     print(f'Failed to post rating to forum thread: {err}')
 
-        # Fallback 2: the channel the command was run in.
-        #
-        # interaction.channel can be None if discord.py hasn't cached the
-        # channel (common right after a modal submit), so resolve it
-        # explicitly instead of trusting the cached attribute, and catch
-        # broadly -- an AttributeError here must not silently kill the
-        # rest of on_submit (which would also swallow the ephemeral
-        # confirmation below).
         if not posted_publicly:
             try:
                 target_channel = interaction.channel
@@ -557,7 +675,7 @@ class RatingModal(discord.ui.Modal, title='Rate this product'):
                 else:
                     print('Failed to post rating embed: could not resolve a channel to post in.')
                     post_note = ' (Gagal posting embed rating, tapi rating sudah tersimpan.)'
-            except Exception as err:  # noqa: BLE001
+            except Exception as err:
                 print(f'Failed to post rating embed to channel: {err}')
                 post_note = ' (Gagal posting embed rating, tapi rating sudah tersimpan.)'
 
@@ -574,9 +692,6 @@ class RatingModal(discord.ui.Modal, title='Rate this product'):
         )
 
 
-# ---------------------------------------------------------------------------
-# /product view -- type/product paginator
-# ---------------------------------------------------------------------------
 class ProductViewView(discord.ui.View):
     def __init__(self, *, owner_id: int, guild_id: str, types: list[dict]):
         super().__init__(timeout=10 * 60)
@@ -621,6 +736,8 @@ class ProductViewView(discord.ui.View):
         embed.add_field(name='Harga', value=product['price'], inline=True)
         embed.add_field(name='Jenis', value=product['type'], inline=True)
         embed.add_field(name='Kreator', value=product['creator'], inline=True)
+        embed.add_field(name='Versi', value=f"v{product_version(product)}", inline=True)
+        embed.add_field(name='Stok', value=stock_summary_text(product), inline=True)
         embed.add_field(name='ID Produk', value=f'`{product["productId"]}`', inline=False)
 
         if product.get('reviewCount'):
@@ -640,10 +757,6 @@ class ProductViewView(discord.ui.View):
 
     def _build_components(self, disabled: bool = False):
         self.clear_items()
-        # Product count for current view is computed synchronously from cache
-        # (populated already once build_embed has run at least once); use a
-        # conservative default of "more than one" until known to avoid
-        # disabling prematurely.
         products = self._products_cache.get(self.types[self.type_index]['id'], [])
 
         type_prev = discord.ui.Button(label='◀◀ Jenis', style=discord.ButtonStyle.secondary, disabled=disabled or len(self.types) <= 1)
@@ -693,9 +806,6 @@ class ProductViewView(discord.ui.View):
                 pass
 
 
-# ---------------------------------------------------------------------------
-# /product get -- autocomplete
-# ---------------------------------------------------------------------------
 async def _autocomplete_get_product_uuid(interaction: discord.Interaction, current: str):
     focused = (current or '').lower()
 
@@ -709,10 +819,6 @@ async def _autocomplete_get_product_uuid(interaction: discord.Interaction, curre
     return [app_commands.Choice(name=p['name'][:100], value=p['id']) for p in filtered]
 
 
-# ---------------------------------------------------------------------------
-# Admin-facing autocomplete -- every product in the guild, not just ones the
-# invoking user owns. Used on edit/delete/give/revoke/sendpost/groupwhitelist.
-# ---------------------------------------------------------------------------
 async def _autocomplete_any_product_uuid(interaction: discord.Interaction, current: str):
     if interaction.guild_id is None:
         return []
@@ -726,9 +832,130 @@ async def _autocomplete_any_product_uuid(interaction: discord.Interaction, curre
     ]
 
 
-# ---------------------------------------------------------------------------
-# Cog
-# ---------------------------------------------------------------------------
+_LIVE_QRIS_VIEWS: dict[str, 'QRISPaymentView'] = {}
+
+
+async def notify_order_paid(bot: commands.Bot, order_id: str, order: dict):
+    """Called by utils/webhook_server when Pakasir's webhook confirms a
+    payment. Delivers immediately if we still have the live view for this
+    order in memory; otherwise this is a no-op and the view's own polling
+    loop (or a fresh /product buy poll after a restart) will pick it up.
+    """
+    view = _LIVE_QRIS_VIEWS.get(order_id)
+    if view is not None:
+        await view._deliver(bot, order)
+
+
+class QRISPaymentView(discord.ui.View):
+    def __init__(self, *, order_id: str, product: dict, buyer_id: str):
+        super().__init__(timeout=QRIS_POLL_TIMEOUT_S)
+        self.order_id = order_id
+        self.product = product
+        self.buyer_id = buyer_id
+        self.message: discord.Message | None = None
+        self._delivered = False
+        self._poll_task: asyncio.Task | None = None
+        _LIVE_QRIS_VIEWS[order_id] = self
+
+    def start_polling(self, client: discord.Client):
+        self._poll_task = asyncio.create_task(self._poll_loop(client))
+
+    async def _poll_loop(self, client: discord.Client):
+        elapsed = 0
+        while elapsed < QRIS_POLL_TIMEOUT_S and not self._delivered:
+            await asyncio.sleep(QRIS_POLL_INTERVAL_S)
+            elapsed += QRIS_POLL_INTERVAL_S
+            try:
+                order = await confirm_payment(self.order_id)
+            except PaymentGatewayError as err:
+                print(f'[product buy] poll confirm_payment failed for {self.order_id}: {err}')
+                continue
+            if order:
+                await self._deliver(client, order)
+                return
+
+        if not self._delivered:
+            _LIVE_QRIS_VIEWS.pop(self.order_id, None)
+            await mark_order_status(self.order_id, 'expired')
+            if self.message:
+                try:
+                    embed = self.message.embeds[0]
+                    embed.set_field_at(1, name='Status', value='⌛ Kadaluarsa', inline=True)
+                    for item in self.children:
+                        item.disabled = True
+                    await self.message.edit(embed=embed, view=self)
+                except discord.HTTPException:
+                    pass
+
+    async def _deliver(self, client: discord.Client, order: dict):
+        if self._delivered:
+            return
+        self._delivered = True
+        _LIVE_QRIS_VIEWS.pop(self.order_id, None)
+        for item in self.children:
+            item.disabled = True
+
+        file_link = await draw_stock_unit(self.product['id'])
+
+        try:
+            await give_product_to_user(self.product['id'], self.buyer_id)
+            await auto_whitelist_product_for_user(self.product['id'], self.buyer_id)
+        except Exception as err:
+            print(f"Failed to grant product {self.product['id']} to {self.buyer_id} after payment: {err}")
+
+        buyer = client.get_user(int(self.buyer_id))
+        if buyer is None:
+            try:
+                buyer = await client.fetch_user(int(self.buyer_id))
+            except discord.HTTPException:
+                buyer = None
+
+        if buyer and file_link:
+            try:
+                await buyer.send(**build_product_delivery_dm(self.product, file_link=file_link))
+            except discord.HTTPException:
+                pass
+
+        if self.message:
+            try:
+                embed = self.message.embeds[0]
+                embed.set_field_at(1, name='Status', value='✅ Lunas -- produk dikirim ke DM', inline=True)
+                await self.message.edit(embed=embed, view=self)
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(label='Cek Pembayaran', style=discord.ButtonStyle.primary, emoji='🔄')
+    async def check_now(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.buyer_id:
+            return await interaction.response.send_message('Hanya pembeli yang bisa mengecek pembayaran ini.', ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            order = await confirm_payment(self.order_id)
+        except PaymentGatewayError as err:
+            print(f'[product buy] manual confirm_payment failed for {self.order_id}: {err}')
+            return await interaction.followup.send('Gagal mengecek status pembayaran. Coba lagi sebentar lagi.', ephemeral=True)
+
+        if not order:
+            return await interaction.followup.send('Belum ada pembayaran yang terdeteksi. Coba lagi setelah selesai scan.', ephemeral=True)
+
+        await self._deliver(interaction.client, order)
+        await interaction.followup.send('✅ Pembayaran terkonfirmasi, produk sudah dikirim ke DM kamu!', ephemeral=True)
+
+    async def on_timeout(self):
+        if self._delivered:
+            return
+        _LIVE_QRIS_VIEWS.pop(self.order_id, None)
+        await mark_order_status(self.order_id, 'expired')
+        if self.message:
+            try:
+                for item in self.children:
+                    item.disabled = True
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
 class ProductCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -766,7 +993,7 @@ class ProductCog(commands.Cog):
         if channel is not None:
             try:
                 result = await link_existing_forum_to_type(interaction.guild, str(interaction.guild_id), type_name, channel)
-            except Exception as err:  # noqa: BLE001
+            except Exception as err:
                 print(f'link_existing_forum_to_type failed (via createtype): {err}')
                 await log_command_activity(
                     interaction, subcommand='createtype', success=False,
@@ -788,7 +1015,7 @@ class ProductCog(commands.Cog):
 
         try:
             result = await create_or_sync_product_type_forum(interaction.guild, str(interaction.guild_id), type_name)
-        except Exception as err:  # noqa: BLE001
+        except Exception as err:
             print(f'create_or_sync_product_type_forum failed: {err}')
             await log_command_activity(
                 interaction, subcommand='createtype', success=False,
@@ -820,7 +1047,7 @@ class ProductCog(commands.Cog):
 
         try:
             result = await link_existing_forum_to_type(interaction.guild, str(interaction.guild_id), type_name, channel)
-        except Exception as err:  # noqa: BLE001
+        except Exception as err:
             print(f'link_existing_forum_to_type failed: {err}')
             await log_command_activity(
                 interaction, subcommand='linktype', success=False,
@@ -890,6 +1117,8 @@ class ProductCog(commands.Cog):
         embed.add_field(name='Harga', value='GRATIS' if is_free else product['price'], inline=True)
         embed.add_field(name='Jenis', value=product['type'], inline=True)
         embed.add_field(name='Kreator', value=product['creator'], inline=True)
+        embed.add_field(name='Versi', value=f"v{product_version(product)}", inline=True)
+        embed.add_field(name='Stok', value=stock_summary_text(product), inline=True)
 
         if product.get('reviewCount'):
             embed.add_field(name='Rating', value=f"⭐ {product['reviewAvg']}/10 ({product['reviewCount']} rating)", inline=True)
@@ -942,7 +1171,7 @@ class ProductCog(commands.Cog):
                 await starter_message.edit(content=post_content, embed=embed, view=view)
                 thread = existing_thread
                 was_update = True
-            except Exception as err:  # noqa: BLE001
+            except Exception as err:
                 print(f'Failed to edit existing forum post in place, falling back to new thread: {err}')
                 existing_thread = None
 
@@ -952,7 +1181,7 @@ class ProductCog(commands.Cog):
                     name=product['name'], content=post_content, embed=embed, view=view,
                 )
                 thread = thread_with_message.thread
-            except Exception as err:  # noqa: BLE001
+            except Exception as err:
                 print(f'Forum post creation failed: {err}')
                 await log_command_activity(
                     interaction, subcommand='sendpost', success=False,
@@ -969,7 +1198,7 @@ class ProductCog(commands.Cog):
         if not was_update:
             try:
                 await save_product(product_id, {**product, 'forumThreadId': str(thread.id)})
-            except Exception as err:  # noqa: BLE001
+            except Exception as err:
                 print(f'Failed to save forumThreadId onto product (post itself succeeded): {err}')
 
         verb = 'diperbarui' if was_update else 'diposting'
@@ -994,6 +1223,126 @@ class ProductCog(commands.Cog):
             return await interaction.response.send_message(f'Produk dengan ID `{product_id}` tidak ditemukan.', ephemeral=True)
 
         await interaction.response.send_modal(EditModal1(interaction, product, product_id))
+
+    @product_group.command(name='update', description='Bump a product to a new version with a changelog (stock/links untouched)')
+    @app_commands.describe(product_uuid='ID produk (UUID)')
+    @app_commands.autocomplete(product_uuid=_autocomplete_any_product_uuid)
+    async def update(self, interaction: discord.Interaction, product_uuid: str):
+        if not await self._guild_check(interaction):
+            return
+        if not _require_admin(interaction):
+            return await _admin_denied(interaction)
+
+        product_id = product_uuid.strip()
+        product = await get_product(product_id)
+        if not product:
+            await log_command_activity(
+                interaction, subcommand='update', success=False,
+                fields={'discordUser': interaction.user, 'productId': product_id}, note='Product UUID not found.',
+            )
+            return await interaction.response.send_message(f'Produk dengan ID `{product_id}` tidak ditemukan.', ephemeral=True)
+
+        await interaction.response.send_modal(UpdateModal(interaction, product, product_id))
+
+    @product_group.command(name='setstock', description='Add a stock batch (file link + quantity, or infinite) to a product')
+    @app_commands.describe(product_uuid='ID produk (UUID)')
+    @app_commands.autocomplete(product_uuid=_autocomplete_any_product_uuid)
+    async def setstock(self, interaction: discord.Interaction, product_uuid: str):
+        if not await self._guild_check(interaction):
+            return
+        if not _require_admin(interaction):
+            return await _admin_denied(interaction)
+
+        product_id = product_uuid.strip()
+        product = await get_product(product_id)
+        if not product:
+            await log_command_activity(
+                interaction, subcommand='setstock', success=False,
+                fields={'discordUser': interaction.user, 'productId': product_id}, note='Product UUID not found.',
+            )
+            return await interaction.response.send_message(f'Produk dengan ID `{product_id}` tidak ditemukan.', ephemeral=True)
+
+        await interaction.response.send_modal(SetStockModal(interaction, product, product_id))
+
+    @product_group.command(name='buy', description='Generate a QRIS payment for this order ticket and auto-deliver once paid')
+    async def buy(self, interaction: discord.Interaction):
+        if not await self._guild_check(interaction):
+            return
+
+        await interaction.response.defer()
+
+        ticket = await get_ticket(str(interaction.channel_id))
+        if not ticket or ticket.get('category') != 'order':
+            return await interaction.followup.send('This command only works inside an order ticket. Open one from the ticket panel first.')
+
+        if ticket.get('creatorId') != str(interaction.user.id):
+            return await interaction.followup.send('Only the person who opened this ticket can run `/product buy` here.')
+
+        if ticket.get('status') != 'open':
+            return await interaction.followup.send('This ticket is already closed.')
+
+        line_items = ticket.get('products') or []
+        if len(line_items) != 1:
+            return await interaction.followup.send(
+                'Automatic QRIS checkout only supports a single product per ticket right now. '
+                'Ask an admin to help with a multi-product order.'
+            )
+
+        if not pakasir_configured():
+            return await interaction.followup.send('Payment gateway is not configured yet. Ask an admin to set `PAKASIR_PROJECT` / `PAKASIR_API_KEY`.')
+
+        existing_order = await find_pending_order_for_channel(str(interaction.channel_id))
+        if existing_order:
+            return await interaction.followup.send(
+                f"A payment is already pending for this ticket (expires {existing_order.get('expiredAt', 'soon')}). "
+                f"Scan the QR code above, or wait for it to expire before running `/product buy` again."
+            )
+
+        item = line_items[0]
+        product = await get_product(item['productId'])
+        if not product:
+            return await interaction.followup.send('That product no longer exists. Ask an admin to check this order.')
+
+        if not is_in_stock(product):
+            return await interaction.followup.send(f"**{product['name']}** is out of stock right now. Ask an admin to `/product setstock`.")
+
+        amount = item.get('lineTotal') or _parse_price_local(item.get('price'))
+        if amount <= 0:
+            return await interaction.followup.send('This product is free -- ask an admin to `/product give` it to you directly instead.')
+
+        try:
+            order = await create_payment_order(
+                guild_id=str(interaction.guild_id), channel_id=str(interaction.channel_id),
+                buyer_id=str(interaction.user.id), product_id=product['id'],
+                product_name=product['name'], amount=amount,
+            )
+        except PaymentGatewayError as err:
+            print(f'[product buy] create_payment_order failed: {err}')
+            await log_command_activity(
+                interaction, subcommand='buy', success=False,
+                fields={'discordUser': interaction.user, 'productId': product['id'], 'productName': product['name']},
+                note='Pakasir transactioncreate failed.',
+            )
+            return await interaction.followup.send('Failed to generate a QRIS payment. Please try again in a moment.')
+
+        qr_file = _render_qris_image(order['qrisString'], order['orderId'])
+
+        embed = discord.Embed(title=f"Pay for {product['name']}", color=0x00B0F4)
+        embed.add_field(name='Total', value=_format_idr_local(amount), inline=True)
+        embed.add_field(name='Status', value='⏳ Menunggu pembayaran', inline=True)
+        embed.set_footer(text='Scan pakai e-wallet apa saja yang support QRIS. Kadaluarsa dalam ~30 menit.')
+        embed.set_image(url=f'attachment://{qr_file.filename}')
+
+        view = QRISPaymentView(order_id=order['orderId'], product=product, buyer_id=str(interaction.user.id))
+        message = await interaction.followup.send(embed=embed, file=qr_file, view=view, wait=True)
+        view.message = message
+        view.start_polling(interaction.client)
+
+        await log_command_activity(
+            interaction, subcommand='buy', success=True,
+            fields={'discordUser': interaction.user, 'productId': product['id'], 'productName': product['name']},
+            note=f"QRIS order {order['orderId']} created, amount {amount}.",
+        )
 
     @product_group.command(name='view', description='Browse all products by type')
     async def view(self, interaction: discord.Interaction):
@@ -1067,7 +1416,7 @@ class ProductCog(commands.Cog):
 
         try:
             await give_product_to_user(product_id, str(user.id))
-        except Exception as err:  # noqa: BLE001
+        except Exception as err:
             print(f'Failed to give product (Firestore write failed): {err}')
             await log_command_activity(
                 interaction, subcommand='give', success=False,
@@ -1081,7 +1430,7 @@ class ProductCog(commands.Cog):
             granted_group_ids = await auto_whitelist_product_for_user(product_id, str(user.id))
             if granted_group_ids:
                 auto_note = f" Otomatis di-whitelist ke group yang sudah ditautkan: {', '.join(f'`{g}`' for g in granted_group_ids)}."
-        except Exception as err:  # noqa: BLE001
+        except Exception as err:
             print(f'auto_whitelist_product_for_user failed (product still given): {err}')
             auto_note = ' (Auto-whitelist ke group gagal, cek manual dengan /product groupwhitelist.)'
 
@@ -1123,7 +1472,7 @@ class ProductCog(commands.Cog):
 
         try:
             await revoke_product_from_user(product_id, str(user.id))
-        except Exception as err:  # noqa: BLE001
+        except Exception as err:
             print(f'Failed to revoke product (Firestore write failed): {err}')
             await log_command_activity(
                 interaction, subcommand='revoke', success=False,
@@ -1137,7 +1486,7 @@ class ProductCog(commands.Cog):
             removed_group_ids = await auto_revoke_product_for_user(product_id, str(user.id))
             if removed_group_ids:
                 auto_note = f" Whitelist otomatis ke group juga dicabut: {', '.join(f'`{g}`' for g in removed_group_ids)}."
-        except Exception as err:  # noqa: BLE001
+        except Exception as err:
             print(f'auto_revoke_product_for_user failed (product still revoked): {err}')
             auto_note = ' (Gagal auto-cabut whitelist group, cek manual dengan /product groupwhitelist.)'
 
@@ -1283,7 +1632,7 @@ class ProductCog(commands.Cog):
 
         try:
             await set_testimony_count(str(interaction.guild_id), count)
-        except Exception as err:  # noqa: BLE001
+        except Exception as err:
             print(f'Failed to set testimonyCount: {err}')
             await log_command_activity(
                 interaction, subcommand='settesticount', success=False,
@@ -1314,7 +1663,7 @@ class ProductCog(commands.Cog):
         try:
             await save_reviews_channel(str(interaction.guild_id), str(channel.id))
             await save_reviews_mod_role(str(interaction.guild_id), str(mod_role.id) if mod_role else None)
-        except Exception as err:  # noqa: BLE001
+        except Exception as err:
             print(f'Failed to save reviews channel config: {err}')
             await log_command_activity(
                 interaction, subcommand='setreviewschannel', success=False,
