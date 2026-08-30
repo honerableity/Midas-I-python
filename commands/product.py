@@ -40,18 +40,14 @@ from utils.verification import get_verified_user
 from utils.tickets import get_ticket, get_testi_channel, next_ticket_number
 from utils.payments import (
     PaymentGatewayError,
-    WITHDRAW_FEES,
     confirm_payment,
     create_payment_order,
     find_all_pending_orders,
     find_latest_order_for_channel,
     find_pending_order_for_channel,
-    get_account_balance,
     mark_order_status,
     pakasir_configured,
     set_order_message,
-    withdraw_balance,
-    withdraw_configured,
 )
 
 COMMAND_NAME = 'product'
@@ -77,7 +73,6 @@ LOG_SCHEMA = {
         'rating': {'label': 'Product — Rated', 'fields': ['discordUser', 'productId', 'productName', 'rating']},
         'settesticount': {'label': 'Product — Guild Testimony Count Edited', 'fields': ['discordUser', 'count']},
         'setreviewschannel': {'label': 'Product — Reviews Channel Set', 'fields': ['discordUser', 'reviewsChannel', 'modRole']},
-        'withdraw': {'label': 'Product — Withdraw', 'fields': ['discordUser', 'amount']},
     },
 }
 
@@ -89,22 +84,12 @@ _DIGITS_RE = re.compile(r'[^0-9]')
 QRIS_POLL_INTERVAL_S = 5
 QRIS_POLL_TIMEOUT_S = 30 * 60
 
-# Default withdraw destination for /withdraw. Kept as a named constant
-# instead of repeated inline so it's a one-line change if the destination
-# ever needs to move.
-WITHDRAW_DESTINATION = {'jenis': 'ewallet', 'bank': 'GOPAY', 'nomor': '082384636491', 'nama': 'HUH'}
-
-
 def _now_ms():
     return int(time.time() * 1000)
 
 
 def _require_admin(interaction: discord.Interaction) -> bool:
     return bool(interaction.user.guild_permissions.administrator)
-
-
-def _require_server_owner(interaction: discord.Interaction) -> bool:
-    return interaction.guild is not None and interaction.guild.owner_id == interaction.user.id
 
 
 def _format_idr_local(n) -> str:
@@ -1152,71 +1137,6 @@ class QRISPaymentView(discord.ui.View):
                 pass
 
 
-class WithdrawConfirmView(discord.ui.View):
-    """One-time confirm/cancel gate in front of an actual withdraw call --
-    withdraw_balance() deducts real money the instant it succeeds with no
-    undo, so this makes sure /withdraw amount always needs an explicit
-    second click before anything is sent to ARTAN SHOP.
-    """
-
-    def __init__(self, requester_id: int, amount: int):
-        super().__init__(timeout=120)
-        self.requester_id = requester_id
-        self.amount = amount
-        self._used = False
-
-    async def _guard(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.requester_id:
-            await interaction.response.send_message('Cuma yang menjalankan command ini yang bisa konfirmasi.', ephemeral=True)
-            return False
-        if self._used:
-            await interaction.response.send_message('Konfirmasi ini sudah dipakai.', ephemeral=True)
-            return False
-        return True
-
-    @discord.ui.button(label='Konfirmasi Withdraw', style=discord.ButtonStyle.danger, emoji='✅')
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self._guard(interaction):
-            return
-        self._used = True
-        for item in self.children:
-            item.disabled = True
-        await interaction.response.edit_message(view=self)
-
-        try:
-            await withdraw_balance(
-                jenis=WITHDRAW_DESTINATION['jenis'],
-                bank=WITHDRAW_DESTINATION['bank'],
-                nomor=WITHDRAW_DESTINATION['nomor'],
-                nama=WITHDRAW_DESTINATION['nama'],
-                jumlah=self.amount,
-            )
-        except PaymentGatewayError as err:
-            print(f'[product withdraw] withdraw_balance failed: {err}')
-            await interaction.followup.send(f'❌ Withdraw gagal: {err}', ephemeral=True)
-            return
-
-        await log_command_activity(
-            interaction, subcommand='withdraw', success=True,
-            fields={'discordUser': interaction.user, 'amount': self.amount},
-            note=f"Withdrawn to {WITHDRAW_DESTINATION['bank']} {WITHDRAW_DESTINATION['nomor']}.",
-        )
-        await interaction.followup.send(
-            f"✅ Withdraw {_format_idr_local(self.amount)} ke {WITHDRAW_DESTINATION['bank']} "
-            f"{WITHDRAW_DESTINATION['nomor']} berhasil diajukan. Status: pending sampai diproses ARTAN SHOP.",
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label='Batal', style=discord.ButtonStyle.secondary, emoji='✖️')
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self._guard(interaction):
-            return
-        self._used = True
-        for item in self.children:
-            item.disabled = True
-        await interaction.response.edit_message(content='Withdraw dibatalkan.', embed=None, view=self)
-
-
 class ProductCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -1983,50 +1903,6 @@ class ProductCog(commands.Cog):
         )
 
         await interaction.followup.send(f'Testimony count server ini diset ke **{count}**.')
-
-    @product_group.command(name='withdraw', description='[Owner only] Withdraw ARTAN SHOP balance to GoPay')
-    @app_commands.describe(amount='Nominal yang ditarik dalam Rupiah (minimal Rp3.000)')
-    async def withdraw(self, interaction: discord.Interaction, amount: app_commands.Range[int, 3000, None]):
-        if not await self._guild_check(interaction):
-            return
-        if not _require_server_owner(interaction):
-            return await interaction.response.send_message(
-                'Command ini cuma bisa dipakai oleh pemilik server.', ephemeral=True
-            )
-
-        if not withdraw_configured():
-            return await interaction.response.send_message(
-                'TOKOSHOPP_USERNAME/TOKOSHOPP_PASSWORD belum di-set di .env.', ephemeral=True
-            )
-
-        await interaction.response.defer(ephemeral=True)
-
-        try:
-            balance = await get_account_balance()
-        except PaymentGatewayError as err:
-            print(f'[product withdraw] get_account_balance failed: {err}')
-            return await interaction.followup.send('Gagal mengecek saldo ARTAN SHOP. Coba lagi sebentar lagi.', ephemeral=True)
-
-        fee = WITHDRAW_FEES.get(WITHDRAW_DESTINATION['bank'], 500)
-        total_deducted = amount + fee
-
-        if total_deducted > balance:
-            return await interaction.followup.send(
-                f"Saldo tidak cukup. Saldo saat ini: {_format_idr_local(balance)}, "
-                f"butuh {_format_idr_local(total_deducted)} (nominal {_format_idr_local(amount)} + fee {_format_idr_local(fee)}).",
-                ephemeral=True,
-            )
-
-        embed = discord.Embed(title='Konfirmasi Withdraw', color=0xFFA500)
-        embed.add_field(name='Nominal', value=_format_idr_local(amount), inline=True)
-        embed.add_field(name='Fee', value=_format_idr_local(fee), inline=True)
-        embed.add_field(name='Total terpotong', value=_format_idr_local(total_deducted), inline=True)
-        embed.add_field(name='Tujuan', value=f"{WITHDRAW_DESTINATION['bank']} — {WITHDRAW_DESTINATION['nomor']}", inline=False)
-        embed.add_field(name='Saldo saat ini', value=_format_idr_local(balance), inline=False)
-        embed.set_footer(text='Aksi ini tidak bisa dibatalkan setelah dikonfirmasi.')
-
-        view = WithdrawConfirmView(interaction.user.id, amount)
-        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     @product_group.command(name='setreviewschannel', description='[Admin] Set the channel where product reviews get posted')
     @app_commands.describe(
