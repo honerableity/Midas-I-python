@@ -37,6 +37,15 @@ RAMASHOP_API_KEY = os.getenv('RAMASHOP_API_KEY')
 
 ORDER_EXPIRY_MS = 30 * 60 * 1000
 
+# aiohttp's default User-Agent ("Python/3.x aiohttp/x.x") reads as a raw
+# HTTP library rather than a real client, which is the kind of signal
+# that can trip an anti-bot check in front of a small API (RamaShop
+# served an HTML "Bot Verification" challenge instead of JSON in testing,
+# on an otherwise valid, correctly-authenticated request). A generic
+# browser-like UA avoids that specific tell without pretending to be any
+# particular browser/version.
+_USER_AGENT = 'Mozilla/5.0 (compatible; MidasBot/1.0; +https://github.com/honerableity/midas-i-python)'
+
 
 class PaymentGatewayError(Exception):
     """Raised on any non-2xx / malformed response from a gateway."""
@@ -54,8 +63,19 @@ def pakasir_configured() -> bool:
     return bool(RAMASHOP_API_KEY)
 
 
-def _headers() -> dict:
-    return {'Content-Type': 'application/json', 'X-API-Key': RAMASHOP_API_KEY or ''}
+def _get_headers() -> dict:
+    # No Content-Type here -- this is used for GET requests (/balance,
+    # /deposit/status) which carry no body. Sending Content-Type on a
+    # bodyless GET is exactly the kind of "not how a real client behaves"
+    # signal that triggered RamaShop's anti-bot "Bot Verification" page in
+    # testing, even though the request was otherwise valid and correctly
+    # authenticated -- a plain curl with just X-API-Key went through fine.
+    return {'X-API-Key': RAMASHOP_API_KEY or '', 'User-Agent': _USER_AGENT}
+
+
+def _post_headers() -> dict:
+    # POST /deposit/create sends a JSON body, so Content-Type belongs here.
+    return {'Content-Type': 'application/json', 'X-API-Key': RAMASHOP_API_KEY or '', 'User-Agent': _USER_AGENT}
 
 
 async def get_account_balance() -> int:
@@ -68,7 +88,7 @@ async def get_account_balance() -> int:
 
     url = f'{RAMASHOP_BASE}/balance'
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=_headers()) as resp:
+        async with session.get(url, headers=_get_headers()) as resp:
             raw = await resp.text()
             try:
                 data = json.loads(raw) if raw.strip() else {}
@@ -94,7 +114,7 @@ async def create_qris_deposit(amount: int) -> dict:
     url = f'{RAMASHOP_BASE}/deposit/create'
     body = {'amount': amount, 'method': 'qris'}
     async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=body, headers=_headers()) as resp:
+        async with session.post(url, json=body, headers=_post_headers()) as resp:
             # Read as raw text first instead of resp.json() directly --
             # RamaShop (or an intermediary like Cloudflare/the host's
             # network) can return a non-JSON body (empty, an HTML error
@@ -132,7 +152,7 @@ async def get_deposit_status(deposit_id: str) -> dict | None:
 
     url = f'{RAMASHOP_BASE}/deposit/status/{deposit_id}'
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=_headers()) as resp:
+        async with session.get(url, headers=_get_headers()) as resp:
             if resp.status == 404:
                 return None
             raw = await resp.text()
