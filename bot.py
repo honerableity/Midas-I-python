@@ -117,9 +117,6 @@ async def setup_hook():
         print('Bot will still start, but slash commands may be out of date. Run `python deploy_commands.py` manually.')
 
 
-_webhook_runner = None
-
-
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user}')
@@ -132,14 +129,6 @@ async def on_ready():
         await resume_pending_payments(bot)
     except Exception as err:
         print(f'[product] resume_pending_payments failed: {err}')
-
-    global _webhook_runner
-    if _webhook_runner is None and os.getenv('WEBHOOK_ENABLED', '1') != '0':
-        from utils.webhook_server import start as start_webhook_server
-        try:
-            _webhook_runner = await start_webhook_server(bot)
-        except Exception as err:
-            print(f'[webhook] Failed to start webhook server (payments still work via polling): {err}')
 
 
 @bot.event
