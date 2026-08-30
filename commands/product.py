@@ -43,9 +43,11 @@ from utils.payments import (
     confirm_payment,
     create_payment_order,
     find_all_pending_orders,
+    find_latest_order_for_channel,
     find_pending_order_for_channel,
     mark_order_status,
     pakasir_configured,
+    set_order_message,
 )
 
 COMMAND_NAME = 'product'
@@ -914,13 +916,16 @@ async def notify_order_paid(bot: commands.Bot, order_id: str, order: dict):
 
 
 async def resume_pending_payments(bot: commands.Bot):
-    """Called once from bot.py's on_ready. QRISPaymentView + its poll loop
-    only live in memory, so a restart while an order is still 'pending'
-    would otherwise strand it -- no live poller, and /product buy refuses
-    to start a new one because find_pending_order_for_channel still finds
-    the old one. This recreates a poll loop (without re-sending a QR
-    message) for every order still 'pending' in Firestore, so payment
-    confirmation and auto-delivery keep working after a restart.
+    """Called once from bot.py's on_ready. Two things need recovering after
+    a restart:
+    1. The poll loop that checks ARTAN SHOP and auto-delivers -- lives only
+       in memory, so it's recreated here for every order still 'pending'
+       in Firestore (elapsed time carried over from createdAt so it still
+       expires on schedule).
+    2. The "Cek Pembayaran" button on the OLD message -- QRISPaymentView is
+       a persistent view (custom_id includes the order_id), so re-adding
+       it via bot.add_view() makes that old button clickable again instead
+       of failing silently.
     Already-expired orders are marked 'expired' instead of resumed.
     """
     orders = await find_all_pending_orders()
@@ -941,9 +946,17 @@ async def resume_pending_payments(bot: commands.Bot):
             continue
 
         view = QRISPaymentView(order_id=order_id, product=product, buyer_id=order['buyerId'])
-        remaining_s = max(1, (order['expiredAt'] - now) // 1000)
-        view.timeout = remaining_s
-        view.start_polling(bot)
+        bot.add_view(view)
+
+        if order.get('channelId') and order.get('messageId'):
+            try:
+                channel = bot.get_channel(int(order['channelId'])) or await bot.fetch_channel(int(order['channelId']))
+                view.message = await channel.fetch_message(int(order['messageId']))
+            except (discord.HTTPException, ValueError):
+                view.message = None
+
+        elapsed_ms = max(0, now - order.get('createdAt', now))
+        view.start_polling(bot, elapsed=elapsed_ms // 1000)
         resumed += 1
 
     if resumed:
@@ -952,20 +965,20 @@ async def resume_pending_payments(bot: commands.Bot):
 
 class QRISPaymentView(discord.ui.View):
     def __init__(self, *, order_id: str, product: dict, buyer_id: str):
-        super().__init__(timeout=QRIS_POLL_TIMEOUT_S)
+        super().__init__(timeout=None)
         self.order_id = order_id
         self.product = product
         self.buyer_id = buyer_id
         self.message: discord.Message | None = None
         self._delivered = False
         self._poll_task: asyncio.Task | None = None
+        self.check_now.custom_id = f'qris_check:{order_id}'
         _LIVE_QRIS_VIEWS[order_id] = self
 
-    def start_polling(self, client: discord.Client):
-        self._poll_task = asyncio.create_task(self._poll_loop(client))
+    def start_polling(self, client: discord.Client, *, elapsed: int = 0):
+        self._poll_task = asyncio.create_task(self._poll_loop(client, elapsed=elapsed))
 
-    async def _poll_loop(self, client: discord.Client):
-        elapsed = 0
+    async def _poll_loop(self, client: discord.Client, *, elapsed: int = 0):
         while elapsed < QRIS_POLL_TIMEOUT_S and not self._delivered:
             await asyncio.sleep(QRIS_POLL_INTERVAL_S)
             elapsed += QRIS_POLL_INTERVAL_S
@@ -990,6 +1003,7 @@ class QRISPaymentView(discord.ui.View):
                     await self.message.edit(embed=embed, view=self)
                 except discord.HTTPException:
                     pass
+            self.stop()
 
     async def _deliver(self, client: discord.Client, order: dict):
         if self._delivered:
@@ -1022,13 +1036,29 @@ class QRISPaymentView(discord.ui.View):
             except discord.HTTPException:
                 pass
 
-        if self.message:
+        # Try to update the message we already know about (freshly created
+        # order in this same process). If we don't have it in memory --
+        # e.g. this view was recreated by resume_pending_payments after a
+        # restart, or _deliver ran from /product forcecheck -- fall back to
+        # fetching the order's stored message so a stale embed on Discord
+        # always catches up with what Firestore already knows.
+        message = self.message
+        if message is None and order.get('channelId') and order.get('messageId'):
             try:
-                embed = self.message.embeds[0]
+                channel = client.get_channel(int(order['channelId'])) or await client.fetch_channel(int(order['channelId']))
+                message = await channel.fetch_message(int(order['messageId']))
+            except (discord.HTTPException, ValueError):
+                message = None
+
+        if message:
+            try:
+                embed = message.embeds[0]
                 embed.set_field_at(1, name='Status', value='✅ Lunas -- produk dikirim ke DM', inline=True)
-                await self.message.edit(embed=embed, view=self)
+                await message.edit(embed=embed, view=self)
             except discord.HTTPException:
                 pass
+
+        self.stop()
 
     @discord.ui.button(label='Cek Pembayaran', style=discord.ButtonStyle.primary, emoji='🔄')
     async def check_now(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1036,6 +1066,10 @@ class QRISPaymentView(discord.ui.View):
             return await interaction.response.send_message('Hanya pembeli yang bisa mengecek pembayaran ini.', ephemeral=True)
 
         await interaction.response.defer(ephemeral=True)
+
+        if self.message is None:
+            self.message = interaction.message
+
         try:
             order = await confirm_payment(self.order_id)
         except PaymentGatewayError as err:
@@ -1049,6 +1083,10 @@ class QRISPaymentView(discord.ui.View):
         await interaction.followup.send('✅ Pembayaran terkonfirmasi, produk sudah dikirim ke DM kamu!', ephemeral=True)
 
     async def on_timeout(self):
+        # Not called in normal operation since timeout=None (this is a
+        # persistent view) -- expiry is handled by _poll_loop's own
+        # elapsed-time check instead, so the button keeps working across
+        # bot restarts. Kept only as a safety net.
         if self._delivered:
             return
         _LIVE_QRIS_VIEWS.pop(self.order_id, None)
@@ -1443,6 +1481,7 @@ class ProductCog(commands.Cog):
         view = QRISPaymentView(order_id=order['orderId'], product=product, buyer_id=str(interaction.user.id))
         message = await interaction.followup.send(embed=embed, file=qr_file, view=view, wait=True)
         view.message = message
+        await set_order_message(order['orderId'], str(message.id))
         view.start_polling(interaction.client)
 
         await log_command_activity(
@@ -1466,9 +1505,9 @@ class ProductCog(commands.Cog):
         if not is_buyer and not _require_admin(interaction):
             return await _admin_denied(interaction)
 
-        order = await find_pending_order_for_channel(str(interaction.channel_id))
+        order = await find_latest_order_for_channel(str(interaction.channel_id))
         if not order:
-            return await interaction.followup.send('No pending payment for this ticket right now.')
+            return await interaction.followup.send('No payment found for this ticket.')
 
         txn_id = order.get('gatewayTransactionId', '-')
 
@@ -1497,6 +1536,20 @@ class ProductCog(commands.Cog):
                 print(f"Failed to grant product {product['id']} to {confirmed['buyerId']} after forcecheck: {err}")
             else:
                 await _post_auto_testimony(interaction.client, confirmed.get('guildId'), confirmed['buyerId'], [product['name']])
+
+            # No live view in memory (e.g. after a restart) -- fall back to
+            # fetching the original QR message directly so its embed still
+            # gets synced to "Lunas" instead of staying stuck.
+            if confirmed.get('channelId') and confirmed.get('messageId'):
+                try:
+                    channel = interaction.client.get_channel(int(confirmed['channelId'])) \
+                        or await interaction.client.fetch_channel(int(confirmed['channelId']))
+                    old_message = await channel.fetch_message(int(confirmed['messageId']))
+                    embed = old_message.embeds[0]
+                    embed.set_field_at(1, name='Status', value='✅ Lunas -- produk dikirim ke DM', inline=True)
+                    await old_message.edit(embed=embed, view=None)
+                except (discord.HTTPException, ValueError, IndexError):
+                    pass
 
         await log_command_activity(
             interaction, subcommand='forcecheck', success=True,
