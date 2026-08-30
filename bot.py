@@ -127,6 +127,12 @@ async def on_ready():
     from utils.moderation import start_expiry_scanner
     start_expiry_scanner(bot)
 
+    from commands.product import resume_pending_payments
+    try:
+        await resume_pending_payments(bot)
+    except Exception as err:
+        print(f'[product] resume_pending_payments failed: {err}')
+
     global _webhook_runner
     if _webhook_runner is None and os.getenv('WEBHOOK_ENABLED', '1') != '0':
         from utils.webhook_server import start as start_webhook_server
