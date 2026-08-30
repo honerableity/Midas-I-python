@@ -9,12 +9,21 @@ webhook body by itself; it always re-queries the provider's own Check
 Status endpoint first.
 
 Env vars required:
-    TOKOSHOPP_API_KEY -- API key from the ARTAN SHOP dashboard's API Key menu
+    TOKOSHOPP_API_KEY   -- API key from the ARTAN SHOP dashboard's API Key menu,
+                           used for Create Payment / Check Status (x-api-key header)
+    TOKOSHOPP_USERNAME  -- ARTAN SHOP dashboard login, only needed for /withdraw
+    TOKOSHOPP_PASSWORD  -- ARTAN SHOP dashboard login, only needed for /withdraw
 
 Unlike some gateways, ARTAN SHOP's Check Status endpoint is keyed by
 *their* transaction_id, not the order_id we chose -- so we store their
 transaction_id on our own order record the moment Create Payment returns
 it, and use that for every later lookup.
+
+Withdraw (/withdraw command) uses a SEPARATE auth scheme from the rest of
+this file: it acts on behalf of the ARTAN SHOP account itself, via a login
+token from POST /login (username+password), not the x-api-key. That token
+is short-lived-ish and account-wide, so it's cached in memory and never
+logged or stored in Firestore.
 """
 import os
 import time
@@ -25,8 +34,14 @@ from utils.firebase import db
 
 TOKOSHOPP_BASE = 'https://tokoshopp.web.id'
 TOKOSHOPP_API_KEY = os.getenv('TOKOSHOPP_API_KEY')
+TOKOSHOPP_USERNAME = os.getenv('TOKOSHOPP_USERNAME')
+TOKOSHOPP_PASSWORD = os.getenv('TOKOSHOPP_PASSWORD')
 
 ORDER_EXPIRY_MS = 30 * 60 * 1000
+WITHDRAW_MIN_AMOUNT = 3000
+WITHDRAW_FEES = {'DANA': 500, 'OVO': 500, 'GOPAY': 500}
+
+_login_token_cache: dict = {'token': None, 'username': None}
 
 
 class PaymentGatewayError(Exception):
@@ -47,6 +62,83 @@ def pakasir_configured() -> bool:
 
 def _headers() -> dict:
     return {'Content-Type': 'application/json', 'x-api-key': TOKOSHOPP_API_KEY or ''}
+
+
+def withdraw_configured() -> bool:
+    return bool(TOKOSHOPP_USERNAME and TOKOSHOPP_PASSWORD)
+
+
+async def _login_for_token() -> str:
+    """Logs into the ARTAN SHOP dashboard account and returns a fresh
+    token. Cached in memory (_login_token_cache) so /withdraw doesn't log
+    in on every single call -- only re-logs in if a withdraw attempt comes
+    back unauthorized.
+    """
+    if not withdraw_configured():
+        raise PaymentGatewayError('TOKOSHOPP_USERNAME/TOKOSHOPP_PASSWORD not configured.')
+
+    url = f'{TOKOSHOPP_BASE}/login'
+    body = {'username': TOKOSHOPP_USERNAME, 'password': TOKOSHOPP_PASSWORD}
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=body, headers={'Content-Type': 'application/json'}) as resp:
+            data = await resp.json(content_type=None)
+            if resp.status != 200 or not data.get('success') or not data.get('token'):
+                raise PaymentGatewayError(f'ARTAN SHOP login failed ({resp.status}): {data}')
+            _login_token_cache['token'] = data['token']
+            _login_token_cache['username'] = TOKOSHOPP_USERNAME
+            return data['token']
+
+
+async def get_account_balance() -> int:
+    """Login also returns the account's current saldo -- there's no
+    separate balance-check endpoint in the docs, so this just re-logs in
+    and reads it off the response. Used by /withdraw to show/confirm the
+    amount before pulling it, and never cached (balance changes constantly).
+    """
+    if not withdraw_configured():
+        raise PaymentGatewayError('TOKOSHOPP_USERNAME/TOKOSHOPP_PASSWORD not configured.')
+
+    url = f'{TOKOSHOPP_BASE}/login'
+    body = {'username': TOKOSHOPP_USERNAME, 'password': TOKOSHOPP_PASSWORD}
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=body, headers={'Content-Type': 'application/json'}) as resp:
+            data = await resp.json(content_type=None)
+            if resp.status != 200 or not data.get('success'):
+                raise PaymentGatewayError(f'ARTAN SHOP login failed ({resp.status}): {data}')
+            _login_token_cache['token'] = data.get('token')
+            _login_token_cache['username'] = TOKOSHOPP_USERNAME
+            return int(data.get('saldo', 0))
+
+
+async def withdraw_balance(*, jenis: str, bank: str, nomor: str, nama: str, jumlah: int) -> dict:
+    """Calls POST /withdraw against the ARTAN SHOP account. This moves real
+    money out of the account balance the moment it succeeds (jumlah + fee
+    is deducted immediately) -- there is no undo. Retries once with a
+    fresh login token if the cached one is stale/unauthorized.
+    """
+    if not withdraw_configured():
+        raise PaymentGatewayError('TOKOSHOPP_USERNAME/TOKOSHOPP_PASSWORD not configured.')
+    if jumlah < WITHDRAW_MIN_AMOUNT:
+        raise PaymentGatewayError(f'Minimum withdraw is Rp{WITHDRAW_MIN_AMOUNT:,}.'.replace(',', '.'))
+
+    token = _login_token_cache.get('token') or await _login_for_token()
+    body = {'jenis': jenis, 'bank': bank, 'nomor': nomor, 'nama': nama, 'jumlah': jumlah}
+    url = f'{TOKOSHOPP_BASE}/withdraw'
+
+    async def _attempt(tok: str):
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=body, headers={'Content-Type': 'application/json', 'token': tok}) as resp:
+                data = await resp.json(content_type=None)
+                return resp.status, data
+
+    status, data = await _attempt(token)
+    if status == 401:
+        token = await _login_for_token()
+        status, data = await _attempt(token)
+
+    if status != 200 or not data.get('success'):
+        raise PaymentGatewayError(f'ARTAN SHOP withdraw failed ({status}): {data}')
+    return data
 
 
 async def create_qris_payment(order_id: str, amount: int) -> dict:
