@@ -24,6 +24,7 @@ RamaShop has no withdraw endpoint at all (balance can only be checked,
 not pulled out via API) -- withdrawals for this account are handled
 manually through the RamaShop dashboard, outside this bot.
 """
+import json
 import os
 import time
 
@@ -68,7 +69,13 @@ async def get_account_balance() -> int:
     url = f'{RAMASHOP_BASE}/balance'
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=_headers()) as resp:
-            data = await resp.json(content_type=None)
+            raw = await resp.text()
+            try:
+                data = json.loads(raw) if raw.strip() else {}
+            except json.JSONDecodeError:
+                raise PaymentGatewayError(
+                    f'RamaShop balance check returned a non-JSON response ({resp.status}): {raw[:300]!r}'
+                )
             if resp.status != 200 or not data.get('success'):
                 raise PaymentGatewayError(f'RamaShop balance check failed ({resp.status}): {data}')
             return int(data.get('data', {}).get('balance', 0))
@@ -88,7 +95,21 @@ async def create_qris_deposit(amount: int) -> dict:
     body = {'amount': amount, 'method': 'qris'}
     async with aiohttp.ClientSession() as session:
         async with session.post(url, json=body, headers=_headers()) as resp:
-            data = await resp.json(content_type=None)
+            # Read as raw text first instead of resp.json() directly --
+            # RamaShop (or an intermediary like Cloudflare/the host's
+            # network) can return a non-JSON body (empty, an HTML error
+            # page, a plain-text rate-limit message) on error responses,
+            # and parsing that straight as JSON crashes with an opaque
+            # "Expecting value: line 1 column 1" that hides what the
+            # server actually sent. Surfacing the real status+body here
+            # makes that failure diagnosable instead of a bare traceback.
+            raw = await resp.text()
+            try:
+                data = json.loads(raw) if raw.strip() else {}
+            except json.JSONDecodeError:
+                raise PaymentGatewayError(
+                    f'RamaShop deposit/create returned a non-JSON response ({resp.status}): {raw[:300]!r}'
+                )
             if resp.status != 200 or not data.get('success'):
                 raise PaymentGatewayError(f'RamaShop deposit/create failed ({resp.status}): {data}')
             return data.get('data', {})
@@ -114,7 +135,13 @@ async def get_deposit_status(deposit_id: str) -> dict | None:
         async with session.get(url, headers=_headers()) as resp:
             if resp.status == 404:
                 return None
-            data = await resp.json(content_type=None)
+            raw = await resp.text()
+            try:
+                data = json.loads(raw) if raw.strip() else {}
+            except json.JSONDecodeError:
+                raise PaymentGatewayError(
+                    f'RamaShop deposit/status returned a non-JSON response ({resp.status}): {raw[:300]!r}'
+                )
             if resp.status != 200 or not data.get('status'):
                 raise PaymentGatewayError(f'RamaShop deposit/status failed ({resp.status}): {data}')
             return data.get('data', {})
