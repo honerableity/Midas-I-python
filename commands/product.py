@@ -101,24 +101,14 @@ def _parse_price_local(price_str) -> int:
     return int(digits) if digits else 0
 
 
-def _decode_qr_image(qr_image_data_uri: str, order_id: str) -> discord.File:
-    """Decodes the base64 QR PNG that ARTAN SHOP returns directly from
-    payment/create (data:image/png;base64,...). We never fetch a
-    third-party image URL for this -- the payload came straight from our
-    own server-to-server call to the gateway, not from anything a user
-    could redirect.
+def _qr_image_url(order: dict) -> str | None:
+    """RamaShop returns qrImage as a hosted URL (api.qrserver.com), not a
+    base64 PNG like the old gateway -- so the embed just points its image
+    at that URL directly via set_image(), no discord.File/attachment
+    needed. Kept as a small helper (rather than inlining order['qrImageUrl']
+    everywhere) so a future gateway swap only needs to change this.
     """
-    import base64
-    import io
-
-    raw = qr_image_data_uri or ''
-    if ',' in raw:
-        raw = raw.split(',', 1)[1]
-
-    img_bytes = base64.b64decode(raw) if raw else b''
-    buf = io.BytesIO(img_bytes)
-    safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', order_id)[:60]
-    return discord.File(buf, filename=f'qris_{safe_name}.png')
+    return order.get('qrImageUrl')
 
 
 def _is_free_product(price) -> bool:
@@ -917,7 +907,7 @@ async def notify_order_paid(bot: commands.Bot, order_id: str, order: dict):
 async def resume_pending_payments(bot: commands.Bot):
     """Called once from bot.py's on_ready. Two things need recovering after
     a restart:
-    1. The poll loop that checks ARTAN SHOP and auto-delivers -- lives only
+    1. The poll loop that checks RamaShop and auto-delivers -- lives only
        in memory, so it's recreated here for every order still 'pending'
        in Firestore (elapsed time carried over from createdAt so it still
        expires on schedule).
@@ -1470,7 +1460,7 @@ class ProductCog(commands.Cog):
             )
 
         if not pakasir_configured():
-            return await interaction.followup.send('Payment gateway is not configured yet. Ask an admin to set `TOKOSHOPP_API_KEY`.')
+            return await interaction.followup.send('Payment gateway is not configured yet. Ask an admin to set `RAMASHOP_API_KEY`.')
 
         existing_order = await find_pending_order_for_channel(str(interaction.channel_id))
         if existing_order:
@@ -1502,21 +1492,28 @@ class ProductCog(commands.Cog):
             await log_command_activity(
                 interaction, subcommand='buy', success=False,
                 fields={'discordUser': interaction.user, 'productId': product['id'], 'productName': product['name']},
-                note='ARTAN SHOP payment/create failed.',
+                note='RamaShop deposit/create failed.',
             )
             return await interaction.followup.send('Failed to generate a QRIS payment. Please try again in a moment.')
 
-        qr_file = _decode_qr_image(order['qrImageDataUri'], order['orderId'])
+        # RamaShop matches paid deposits by exact transferred amount, so
+        # the buyer must pay totalAmount (product price + RamaShop's own
+        # unique code, e.g. Rp1.000 -> Rp1.073) -- NOT the bare product
+        # price. Showing `amount` here instead would mean every payment
+        # underpays by the unique code and never gets detected as paid.
+        total_amount = order.get('totalAmount', amount)
+        qr_url = _qr_image_url(order)
 
         embed = discord.Embed(title=f"Pay for {product['name']}", color=0x00B0F4)
-        embed.add_field(name='Total', value=_format_idr_local(amount), inline=True)
+        embed.add_field(name='Total', value=_format_idr_local(total_amount), inline=True)
         embed.add_field(name='Status', value='⏳ Menunggu pembayaran', inline=True)
-        embed.add_field(name='Transaction ID', value=f"`{order.get('gatewayTransactionId', '-')}`", inline=True)
-        embed.set_footer(text='Scan pakai e-wallet apa saja yang support QRIS. Kadaluarsa dalam ~30 menit.')
-        embed.set_image(url=f'attachment://{qr_file.filename}')
+        embed.add_field(name='Deposit ID', value=f"`{order.get('gatewayDepositId', '-')}`", inline=True)
+        embed.set_footer(text='Scan pakai e-wallet apa saja yang support QRIS. Transfer PERSIS nominal di atas (termasuk kode unik). Kadaluarsa dalam ~30 menit.')
+        if qr_url:
+            embed.set_image(url=qr_url)
 
         view = QRISPaymentView(order_id=order['orderId'], product=product, buyer_id=str(interaction.user.id))
-        message = await interaction.followup.send(embed=embed, file=qr_file, view=view, wait=True)
+        message = await interaction.followup.send(embed=embed, view=view, wait=True)
         view.message = message
         await set_order_message(order['orderId'], str(message.id))
         view.start_polling(interaction.client)
@@ -1524,10 +1521,10 @@ class ProductCog(commands.Cog):
         await log_command_activity(
             interaction, subcommand='buy', success=True,
             fields={'discordUser': interaction.user, 'productId': product['id'], 'productName': product['name']},
-            note=f"QRIS order {order['orderId']} created, amount {amount}.",
+            note=f"QRIS order {order['orderId']} created, amount {amount}, total {total_amount}.",
         )
 
-    @product_group.command(name='forcecheck', description='Force-check this ticket\'s pending payment against ARTAN SHOP directly')
+    @product_group.command(name='forcecheck', description='Force-check this ticket\'s pending payment against RamaShop directly')
     async def forcecheck(self, interaction: discord.Interaction):
         if not await self._guild_check(interaction):
             return
@@ -1546,19 +1543,19 @@ class ProductCog(commands.Cog):
         if not order:
             return await interaction.followup.send('No payment found for this ticket.')
 
-        txn_id = order.get('gatewayTransactionId', '-')
+        deposit_id = order.get('gatewayDepositId', '-')
 
         try:
             confirmed = await confirm_payment(order['id'])
         except PaymentGatewayError as err:
             print(f'[product forcecheck] confirm_payment failed for {order["id"]}: {err}')
             return await interaction.followup.send(
-                f"Gagal mengecek status ke ARTAN SHOP. Transaction ID: `{txn_id}`. Coba lagi sebentar lagi."
+                f"Gagal mengecek status ke RamaShop. Deposit ID: `{deposit_id}`. Coba lagi sebentar lagi."
             )
 
         if not confirmed:
             return await interaction.followup.send(
-                f"Belum terbayar menurut ARTAN SHOP. Transaction ID: `{txn_id}`, Order ID: `{order['id']}`."
+                f"Belum terbayar menurut RamaShop. Deposit ID: `{deposit_id}`, Order ID: `{order['id']}`."
             )
 
         product = await get_product(confirmed['productId'])
@@ -1572,7 +1569,7 @@ class ProductCog(commands.Cog):
             except Exception as err:
                 print(f"Failed to grant product {product['id']} to {confirmed['buyerId']} after forcecheck: {err}")
                 return await interaction.followup.send(
-                    f"Pembayaran **sudah lunas** (Transaction ID `{txn_id}`), tapi pengiriman produk gagal karena error "
+                    f"Pembayaran **sudah lunas** (Deposit ID `{deposit_id}`), tapi pengiriman produk gagal karena error "
                     f"teknis. Coba `/product forcecheck` lagi, atau minta admin `/product give` manual."
                 )
             else:
@@ -1595,10 +1592,10 @@ class ProductCog(commands.Cog):
         await log_command_activity(
             interaction, subcommand='forcecheck', success=True,
             fields={'discordUser': interaction.user, 'productId': confirmed['productId'], 'productName': confirmed['productName']},
-            note=f"Transaction ID {txn_id}, order {confirmed['orderId']} confirmed via forcecheck.",
+            note=f"Deposit ID {deposit_id}, order {confirmed['orderId']} confirmed via forcecheck.",
         )
         await interaction.followup.send(
-            f"✅ Pembayaran terkonfirmasi (Transaction ID: `{txn_id}`). Produk sudah dikirim ke DM pembeli."
+            f"✅ Pembayaran terkonfirmasi (Deposit ID: `{deposit_id}`). Produk sudah dikirim ke DM pembeli."
         )
 
     @product_group.command(name='view', description='Browse all products by type')
