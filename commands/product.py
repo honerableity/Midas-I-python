@@ -42,6 +42,7 @@ from utils.payments import (
     PaymentGatewayError,
     confirm_payment,
     create_payment_order,
+    find_all_pending_orders,
     find_pending_order_for_channel,
     mark_order_status,
     pakasir_configured,
@@ -59,6 +60,7 @@ LOG_SCHEMA = {
         'update': {'label': 'Product — Version Updated', 'fields': ['discordUser', 'productId', 'productName', 'version']},
         'setstock': {'label': 'Product — Stock Added', 'fields': ['discordUser', 'productId', 'productName', 'quantity']},
         'buy': {'label': 'Product — QRIS Payment Created', 'fields': ['discordUser', 'productId', 'productName']},
+        'forcecheck': {'label': 'Product — Payment Force-Checked', 'fields': ['discordUser', 'productId', 'productName']},
         'view': {'label': 'Product — Browsed', 'fields': ['discordUser']},
         'delete': {'label': 'Product — Deleted', 'fields': ['discordUser', 'productId', 'productName']},
         'give': {'label': 'Product — Given', 'fields': ['discordUser', 'targetUser', 'productId', 'productName']},
@@ -852,6 +854,43 @@ async def notify_order_paid(bot: commands.Bot, order_id: str, order: dict):
         await view._deliver(bot, order)
 
 
+async def resume_pending_payments(bot: commands.Bot):
+    """Called once from bot.py's on_ready. QRISPaymentView + its poll loop
+    only live in memory, so a restart while an order is still 'pending'
+    would otherwise strand it -- no live poller, and /product buy refuses
+    to start a new one because find_pending_order_for_channel still finds
+    the old one. This recreates a poll loop (without re-sending a QR
+    message) for every order still 'pending' in Firestore, so payment
+    confirmation and auto-delivery keep working after a restart.
+    Already-expired orders are marked 'expired' instead of resumed.
+    """
+    orders = await find_all_pending_orders()
+    now = _now_ms()
+    resumed = 0
+    for order in orders:
+        order_id = order['id']
+        if order_id in _LIVE_QRIS_VIEWS:
+            continue
+
+        if order.get('expiredAt', 0) <= now:
+            await mark_order_status(order_id, 'expired')
+            continue
+
+        product = await get_product(order['productId'])
+        if not product:
+            print(f'[resume_pending_payments] order {order_id}: product {order["productId"]} no longer exists, skipping')
+            continue
+
+        view = QRISPaymentView(order_id=order_id, product=product, buyer_id=order['buyerId'])
+        remaining_s = max(1, (order['expiredAt'] - now) // 1000)
+        view.timeout = remaining_s
+        view.start_polling(bot)
+        resumed += 1
+
+    if resumed:
+        print(f'[resume_pending_payments] resumed polling for {resumed} pending order(s) after restart.')
+
+
 class QRISPaymentView(discord.ui.View):
     def __init__(self, *, order_id: str, product: dict, buyer_id: str):
         super().__init__(timeout=QRIS_POLL_TIMEOUT_S)
@@ -1336,6 +1375,7 @@ class ProductCog(commands.Cog):
         embed = discord.Embed(title=f"Pay for {product['name']}", color=0x00B0F4)
         embed.add_field(name='Total', value=_format_idr_local(amount), inline=True)
         embed.add_field(name='Status', value='⏳ Menunggu pembayaran', inline=True)
+        embed.add_field(name='Transaction ID', value=f"`{order.get('gatewayTransactionId', '-')}`", inline=True)
         embed.set_footer(text='Scan pakai e-wallet apa saja yang support QRIS. Kadaluarsa dalam ~30 menit.')
         embed.set_image(url=f'attachment://{qr_file.filename}')
 
@@ -1348,6 +1388,60 @@ class ProductCog(commands.Cog):
             interaction, subcommand='buy', success=True,
             fields={'discordUser': interaction.user, 'productId': product['id'], 'productName': product['name']},
             note=f"QRIS order {order['orderId']} created, amount {amount}.",
+        )
+
+    @product_group.command(name='forcecheck', description='Force-check this ticket\'s pending payment against ARTAN SHOP directly')
+    async def forcecheck(self, interaction: discord.Interaction):
+        if not await self._guild_check(interaction):
+            return
+
+        await interaction.response.defer()
+
+        ticket = await get_ticket(str(interaction.channel_id))
+        if not ticket or ticket.get('category') != 'order':
+            return await interaction.followup.send('This command only works inside an order ticket.')
+
+        is_buyer = ticket.get('creatorId') == str(interaction.user.id)
+        if not is_buyer and not _require_admin(interaction):
+            return await _admin_denied(interaction)
+
+        order = await find_pending_order_for_channel(str(interaction.channel_id))
+        if not order:
+            return await interaction.followup.send('No pending payment for this ticket right now.')
+
+        txn_id = order.get('gatewayTransactionId', '-')
+
+        try:
+            confirmed = await confirm_payment(order['id'])
+        except PaymentGatewayError as err:
+            print(f'[product forcecheck] confirm_payment failed for {order["id"]}: {err}')
+            return await interaction.followup.send(
+                f"Gagal mengecek status ke ARTAN SHOP. Transaction ID: `{txn_id}`. Coba lagi sebentar lagi."
+            )
+
+        if not confirmed:
+            return await interaction.followup.send(
+                f"Belum terbayar menurut ARTAN SHOP. Transaction ID: `{txn_id}`, Order ID: `{order['id']}`."
+            )
+
+        product = await get_product(confirmed['productId'])
+        view = _LIVE_QRIS_VIEWS.get(confirmed['orderId'])
+        if view is not None:
+            await view._deliver(interaction.client, confirmed)
+        elif product:
+            try:
+                await give_product_to_user(product['id'], confirmed['buyerId'])
+                await auto_whitelist_product_for_user(product['id'], confirmed['buyerId'])
+            except Exception as err:
+                print(f"Failed to grant product {product['id']} to {confirmed['buyerId']} after forcecheck: {err}")
+
+        await log_command_activity(
+            interaction, subcommand='forcecheck', success=True,
+            fields={'discordUser': interaction.user, 'productId': confirmed['productId'], 'productName': confirmed['productName']},
+            note=f"Transaction ID {txn_id}, order {confirmed['orderId']} confirmed via forcecheck.",
+        )
+        await interaction.followup.send(
+            f"✅ Pembayaran terkonfirmasi (Transaction ID: `{txn_id}`). Produk sudah dikirim ke DM pembeli."
         )
 
     @product_group.command(name='view', description='Browse all products by type')
