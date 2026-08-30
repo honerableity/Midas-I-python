@@ -1029,13 +1029,35 @@ class QRISPaymentView(discord.ui.View):
 
         file_link = await draw_stock_unit(self.product['id'])
 
+        grant_failed = False
         try:
             await give_product_to_user(self.product['id'], self.buyer_id)
             await auto_whitelist_product_for_user(self.product['id'], self.buyer_id)
         except Exception as err:
+            # Paid orders must never fail silently here -- previously this
+            # was swallowed and the buyer was left with a "paid" order but
+            # no product/whitelist and no error visible anywhere. Un-mark
+            # the delivery so /product forcecheck (or the poller/button)
+            # retries the grant instead of treating this as done.
+            grant_failed = True
+            self._delivered = False
+            _LIVE_QRIS_VIEWS[self.order_id] = self
             print(f"Failed to grant product {self.product['id']} to {self.buyer_id} after payment: {err}")
         else:
             await _post_auto_testimony(client, order.get('guildId'), self.buyer_id, [self.product['name']])
+
+        if grant_failed:
+            buyer = client.get_user(int(self.buyer_id)) or None
+            try:
+                buyer = buyer or await client.fetch_user(int(self.buyer_id))
+                if buyer:
+                    await buyer.send(
+                        f"Pembayaranmu untuk **{self.product['name']}** sudah diterima, tapi ada masalah teknis "
+                        f"saat mengirim produknya. Jalankan `/product forcecheck` di ticket kamu, atau hubungi admin."
+                    )
+            except discord.HTTPException:
+                pass
+            return
 
         buyer = client.get_user(int(self.buyer_id))
         if buyer is None:
@@ -1613,6 +1635,10 @@ class ProductCog(commands.Cog):
                 await auto_whitelist_product_for_user(product['id'], confirmed['buyerId'])
             except Exception as err:
                 print(f"Failed to grant product {product['id']} to {confirmed['buyerId']} after forcecheck: {err}")
+                return await interaction.followup.send(
+                    f"Pembayaran **sudah lunas** (Transaction ID `{txn_id}`), tapi pengiriman produk gagal karena error "
+                    f"teknis. Coba `/product forcecheck` lagi, atau minta admin `/product give` manual."
+                )
             else:
                 await _post_auto_testimony(interaction.client, confirmed.get('guildId'), confirmed['buyerId'], [product['name']])
 
