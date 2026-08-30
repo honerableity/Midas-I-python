@@ -156,6 +156,19 @@ async def find_pending_order_for_channel(channel_id: str) -> dict | None:
     return {'id': docs[0].id, **docs[0].to_dict()}
 
 
+async def find_all_pending_orders() -> list[dict]:
+    """Used on bot startup to resume in-memory polling for orders that
+    were still 'pending' when the process died/restarted. Firestore is
+    the source of truth, so a restart mid-payment never loses the order --
+    only the in-memory QRISPaymentView + poll loop need recreating.
+    Already-expired orders (past expiredAt) are skipped; the caller should
+    mark those 'expired' instead of resuming them.
+    """
+    query = db.collection('paymentOrders').where('status', '==', 'pending')
+    docs = list(query.stream())
+    return [{'id': doc.id, **doc.to_dict()} for doc in docs]
+
+
 async def mark_order_completed(order_id: str):
     db.collection('paymentOrders').document(order_id).set(
         {'status': 'completed', 'completedAt': _now_ms()}, merge=True
