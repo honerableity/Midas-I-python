@@ -37,7 +37,7 @@ from utils.products import (
 from utils.reviews import RATING_MAX, RATING_MIN, get_testimony_count, set_testimony_count, submit_review
 from utils.reviews_channel import get_reviews_channel, save_reviews_channel, save_reviews_mod_role
 from utils.verification import get_verified_user
-from utils.tickets import get_ticket
+from utils.tickets import get_ticket, get_testi_channel, next_ticket_number
 from utils.payments import (
     PaymentGatewayError,
     confirm_payment,
@@ -843,6 +843,65 @@ async def _autocomplete_any_product_uuid(interaction: discord.Interaction, curre
 _LIVE_QRIS_VIEWS: dict[str, 'QRISPaymentView'] = {}
 
 
+async def _post_auto_testimony(client: discord.Client, guild_id: str | None, buyer_id: str, product_names: list[str]):
+    """Posts an automatic testimony embed to the guild's testimonial channel
+    right after a QRIS payment is confirmed and the product whitelist
+    succeeds. Silent no-op if no testimonial channel is configured
+    (/ticket settesti) or if it can't be resolved -- this should never
+    block product delivery.
+    """
+    if not guild_id:
+        return
+
+    testi_channel_id = await get_testi_channel(guild_id)
+    if not testi_channel_id:
+        return
+
+    guild = client.get_guild(int(guild_id))
+    if guild is None:
+        try:
+            guild = await client.fetch_guild(int(guild_id))
+        except discord.HTTPException:
+            return
+
+    testi_channel = guild.get_channel(int(testi_channel_id))
+    if testi_channel is None:
+        try:
+            testi_channel = await guild.fetch_channel(int(testi_channel_id))
+        except discord.HTTPException:
+            return
+
+    try:
+        testi_number = await next_ticket_number(guild_id)
+    except Exception as err:
+        print(f'[auto testimony] next_ticket_number failed for guild {guild_id}: {err}')
+        return
+
+    buyer = client.get_user(int(buyer_id))
+    if buyer is None:
+        try:
+            buyer = await client.fetch_user(int(buyer_id))
+        except discord.HTTPException:
+            buyer = None
+    buyer_mention = buyer.mention if buyer else f'<@{buyer_id}>'
+
+    embed = discord.Embed(
+        title='New Testimony',
+        description=(
+            f"Testimony number {testi_number}\n"
+            f"Buyer: {buyer_mention}\n"
+            f"Products: {', '.join(product_names)}\n\n"
+            f"Thank you! Dont forget to leave a review!"
+        ),
+        color=0x00B0F4,
+    )
+
+    try:
+        await testi_channel.send(embed=embed)
+    except discord.HTTPException as err:
+        print(f'[auto testimony] failed to send to channel {testi_channel_id}: {err}')
+
+
 async def notify_order_paid(bot: commands.Bot, order_id: str, order: dict):
     """Called by utils/webhook_server when the payment gateway's webhook confirms a
     payment. Delivers immediately if we still have the live view for this
@@ -947,6 +1006,8 @@ class QRISPaymentView(discord.ui.View):
             await auto_whitelist_product_for_user(self.product['id'], self.buyer_id)
         except Exception as err:
             print(f"Failed to grant product {self.product['id']} to {self.buyer_id} after payment: {err}")
+        else:
+            await _post_auto_testimony(client, order.get('guildId'), self.buyer_id, [self.product['name']])
 
         buyer = client.get_user(int(self.buyer_id))
         if buyer is None:
@@ -1434,6 +1495,8 @@ class ProductCog(commands.Cog):
                 await auto_whitelist_product_for_user(product['id'], confirmed['buyerId'])
             except Exception as err:
                 print(f"Failed to grant product {product['id']} to {confirmed['buyerId']} after forcecheck: {err}")
+            else:
+                await _post_auto_testimony(interaction.client, confirmed.get('guildId'), confirmed['buyerId'], [product['name']])
 
         await log_command_activity(
             interaction, subcommand='forcecheck', success=True,
