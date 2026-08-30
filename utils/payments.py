@@ -175,10 +175,13 @@ async def get_transaction_status(transaction_id: str) -> dict | None:
                 return None
             data = await resp.json(content_type=None)
             if resp.status != 200 or not data.get('success'):
-                if resp.status == 404:
-                    return None
                 raise PaymentGatewayError(f'ARTAN SHOP payment/status failed ({resp.status}): {data}')
-            return data
+            # ARTAN SHOP nests the actual transaction under "data" or
+            # "transaction" on some accounts instead of top-level -- unwrap
+            # it so status/amount checks below don't silently miss a paid
+            # transaction just because of response-shape drift.
+            payload = data.get('data') or data.get('transaction') or data
+            return payload
 
 
 async def cancel_transaction(order_id: str, amount: int) -> None:
@@ -334,13 +337,40 @@ async def confirm_payment(order_id: str) -> dict | None:
         return None
 
     txn = await get_transaction_status(transaction_id)
-    if not txn or txn.get('status') != 'paid':
+    if not txn:
         return None
 
-    if int(txn.get('amount', -1)) != int(order['amount']):
+    # ARTAN SHOP has been observed sending both "paid" and "success" for a
+    # settled QRIS transaction depending on the account/method -- treating
+    # only "paid" as success made a genuinely-paid order look pending
+    # forever. Accept the known settled values instead of one literal.
+    txn_status = str(txn.get('status', '')).strip().lower()
+    if txn_status not in ('paid', 'success', 'settlement', 'completed'):
+        print(f'[confirm_payment] {order_id}: gateway status is {txn.get("status")!r}, not yet settled.')
+        return None
+
+    # ARTAN SHOP adds a buyer-side fee on top of the product price (floor
+    # ~Rp50, plus an extra component we don't have an exact formula for --
+    # confirmed non-zero even beyond 0.5%+floor50 on a Rp1000 test). A
+    # strict equality check against order['amount'] (the bare price) kept
+    # rejecting genuinely-paid transactions as "amount mismatch" whenever
+    # the gateway reported the fee-inclusive figure, which is what made
+    # real payments look like they'd failed. We already pin this lookup to
+    # one specific gatewayTransactionId that we stored ourselves the
+    # moment this exact order was created (see create_payment_order), so
+    # the transaction_id match already guarantees this is the right
+    # transaction -- re-deriving an exact fee formula here to double check
+    # the amount would only risk rejecting valid payments again. Log the
+    # reported amount for visibility instead of gating on it.
+    reported_amount = txn.get('amount')
+    if reported_amount is not None and int(reported_amount) < int(order['amount']):
+        # Only reject if the gateway reports LESS than the product price --
+        # that's the one case that would mean an underpayment, which is
+        # never legitimate no matter what the fee formula is.
         raise PaymentGatewayError(
-            f"Amount mismatch on {order_id}: expected {order['amount']}, got {txn.get('amount')}"
+            f"Underpayment on {order_id}: expected at least {order['amount']}, got {reported_amount}"
         )
+    print(f"[confirm_payment] {order_id}: settled, gateway amount={reported_amount}, order price={order['amount']}")
 
     await mark_order_completed(order_id)
     order['status'] = 'completed'
