@@ -156,6 +156,32 @@ async def find_pending_order_for_channel(channel_id: str) -> dict | None:
     return {'id': docs[0].id, **docs[0].to_dict()}
 
 
+async def find_latest_order_for_channel(channel_id: str) -> dict | None:
+    """Like find_pending_order_for_channel but also matches orders already
+    marked 'completed'. Used by /product forcecheck so it can still find
+    (and re-sync the embed for) an order that got confirmed by another
+    path -- e.g. the poller or the button -- moments before forcecheck ran,
+    instead of reporting 'no pending payment' just because the status
+    field had already moved on.
+
+    Runs two single-field queries instead of one 'in' + order_by query, to
+    avoid depending on a composite Firestore index that may not exist.
+    """
+    candidates = []
+    for status in ('pending', 'completed'):
+        query = (
+            db.collection('paymentOrders')
+            .where('channelId', '==', channel_id)
+            .where('status', '==', status)
+            .limit(5)
+        )
+        candidates.extend({'id': doc.id, **doc.to_dict()} for doc in query.stream())
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda o: o.get('createdAt', 0))
+
+
 async def find_all_pending_orders() -> list[dict]:
     """Used on bot startup to resume in-memory polling for orders that
     were still 'pending' when the process died/restarted. Firestore is
@@ -179,13 +205,36 @@ async def mark_order_status(order_id: str, status: str):
     db.collection('paymentOrders').document(order_id).set({'status': status}, merge=True)
 
 
+async def set_order_message(order_id: str, message_id: str):
+    """Stores the Discord message ID for the QR-code embed so a stale
+    embed can be found and updated later even without the in-memory
+    QRISPaymentView -- e.g. after a bot restart, or when payment is
+    confirmed via /product forcecheck instead of the button/poller.
+    """
+    db.collection('paymentOrders').document(order_id).set({'messageId': message_id}, merge=True)
+
+
 async def confirm_payment(order_id: str) -> dict | None:
     """Double-checks a webhook (or a manual /product buy status poll)
     directly against ARTAN SHOP before treating a payment as real. Returns
-    the updated order record if it just got confirmed, else None.
+    the order record if it's paid (whether we just confirmed it now, or it
+    was already marked 'completed' earlier -- e.g. a previous check
+    delivered the product but the bot restarted/lost its in-memory view
+    before it could update the embed). Returns None only for orders that
+    are still genuinely pending or don't exist.
     """
     order = await get_payment_order(order_id)
-    if not order or order['status'] != 'pending':
+    if not order:
+        return None
+
+    if order['status'] == 'completed':
+        # Already confirmed earlier. Caller (_deliver) is idempotent --
+        # give_product_to_user/auto_whitelist_product_for_user use
+        # ArrayUnion and are safe to re-run, so this just lets a stale
+        # embed/button catch up to what Firestore already knows.
+        return order
+
+    if order['status'] != 'pending':
         return None
 
     transaction_id = order.get('gatewayTransactionId')
