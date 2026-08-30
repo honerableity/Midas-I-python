@@ -985,6 +985,7 @@ class QRISPaymentView(discord.ui.View):
         self.buyer_id = buyer_id
         self.message: discord.Message | None = None
         self._delivered = False
+        self._deliver_lock = asyncio.Lock()
         self._poll_task: asyncio.Task | None = None
         self.check_now.custom_id = f'qris_check:{order_id}'
         _LIVE_QRIS_VIEWS[order_id] = self
@@ -1020,81 +1021,96 @@ class QRISPaymentView(discord.ui.View):
             self.stop()
 
     async def _deliver(self, client: discord.Client, order: dict):
-        if self._delivered:
-            return
-        self._delivered = True
-        _LIVE_QRIS_VIEWS.pop(self.order_id, None)
-        for item in self.children:
-            item.disabled = True
+        # The poller (_poll_loop, every 5s) and the "Cek Pembayaran" button
+        # (check_now) can both call this at nearly the same moment once a
+        # payment settles. The old self._delivered flag was checked and set
+        # as two separate statements with several `await`s after it -- that
+        # gap let a second concurrent call see _delivered already True and
+        # return immediately while the FIRST call was still in the middle
+        # of granting the product, so the button's "produk sudah dikirim"
+        # message could fire before anything was actually granted, and the
+        # order could be left stuck 'pending' in Firestore. A lock makes
+        # the whole grant+DM+status-update sequence atomic: whichever
+        # caller (poller or button) gets here first runs the entire thing
+        # to completion before the other is allowed in, and the second one
+        # then sees _delivered=True and returns cleanly with nothing left
+        # to do.
+        async with self._deliver_lock:
+            if self._delivered:
+                return
+            self._delivered = True
+            _LIVE_QRIS_VIEWS.pop(self.order_id, None)
+            for item in self.children:
+                item.disabled = True
 
-        file_link = await draw_stock_unit(self.product['id'])
+            file_link = await draw_stock_unit(self.product['id'])
 
-        grant_failed = False
-        try:
-            await give_product_to_user(self.product['id'], self.buyer_id)
-            await auto_whitelist_product_for_user(self.product['id'], self.buyer_id)
-        except Exception as err:
-            # Paid orders must never fail silently here -- previously this
-            # was swallowed and the buyer was left with a "paid" order but
-            # no product/whitelist and no error visible anywhere. Un-mark
-            # the delivery so /product forcecheck (or the poller/button)
-            # retries the grant instead of treating this as done.
-            grant_failed = True
-            self._delivered = False
-            _LIVE_QRIS_VIEWS[self.order_id] = self
-            print(f"Failed to grant product {self.product['id']} to {self.buyer_id} after payment: {err}")
-        else:
-            await _post_auto_testimony(client, order.get('guildId'), self.buyer_id, [self.product['name']])
-
-        if grant_failed:
-            buyer = client.get_user(int(self.buyer_id)) or None
+            grant_failed = False
             try:
-                buyer = buyer or await client.fetch_user(int(self.buyer_id))
-                if buyer:
-                    await buyer.send(
-                        f"Pembayaranmu untuk **{self.product['name']}** sudah diterima, tapi ada masalah teknis "
-                        f"saat mengirim produknya. Jalankan `/product forcecheck` di ticket kamu, atau hubungi admin."
-                    )
-            except discord.HTTPException:
-                pass
-            return
+                await give_product_to_user(self.product['id'], self.buyer_id)
+                await auto_whitelist_product_for_user(self.product['id'], self.buyer_id)
+            except Exception as err:
+                # Paid orders must never fail silently here -- previously this
+                # was swallowed and the buyer was left with a "paid" order but
+                # no product/whitelist and no error visible anywhere. Un-mark
+                # the delivery so /product forcecheck (or the poller/button)
+                # retries the grant instead of treating this as done.
+                grant_failed = True
+                self._delivered = False
+                _LIVE_QRIS_VIEWS[self.order_id] = self
+                print(f"Failed to grant product {self.product['id']} to {self.buyer_id} after payment: {err}")
+            else:
+                await _post_auto_testimony(client, order.get('guildId'), self.buyer_id, [self.product['name']])
 
-        buyer = client.get_user(int(self.buyer_id))
-        if buyer is None:
-            try:
-                buyer = await client.fetch_user(int(self.buyer_id))
-            except discord.HTTPException:
-                buyer = None
+            if grant_failed:
+                buyer = client.get_user(int(self.buyer_id)) or None
+                try:
+                    buyer = buyer or await client.fetch_user(int(self.buyer_id))
+                    if buyer:
+                        await buyer.send(
+                            f"Pembayaranmu untuk **{self.product['name']}** sudah diterima, tapi ada masalah teknis "
+                            f"saat mengirim produknya. Jalankan `/product forcecheck` di ticket kamu, atau hubungi admin."
+                        )
+                except discord.HTTPException:
+                    pass
+                return
 
-        if buyer and file_link:
-            try:
-                await buyer.send(**build_product_delivery_dm(self.product, file_link=file_link))
-            except discord.HTTPException:
-                pass
+            buyer = client.get_user(int(self.buyer_id))
+            if buyer is None:
+                try:
+                    buyer = await client.fetch_user(int(self.buyer_id))
+                except discord.HTTPException:
+                    buyer = None
 
-        # Try to update the message we already know about (freshly created
-        # order in this same process). If we don't have it in memory --
-        # e.g. this view was recreated by resume_pending_payments after a
-        # restart, or _deliver ran from /product forcecheck -- fall back to
-        # fetching the order's stored message so a stale embed on Discord
-        # always catches up with what Firestore already knows.
-        message = self.message
-        if message is None and order.get('channelId') and order.get('messageId'):
-            try:
-                channel = client.get_channel(int(order['channelId'])) or await client.fetch_channel(int(order['channelId']))
-                message = await channel.fetch_message(int(order['messageId']))
-            except (discord.HTTPException, ValueError):
-                message = None
+            if buyer and file_link:
+                try:
+                    await buyer.send(**build_product_delivery_dm(self.product, file_link=file_link))
+                except discord.HTTPException:
+                    pass
 
-        if message:
-            try:
-                embed = message.embeds[0]
-                embed.set_field_at(1, name='Status', value='✅ Lunas -- produk dikirim ke DM', inline=True)
-                await message.edit(embed=embed, view=self)
-            except discord.HTTPException:
-                pass
+            # Try to update the message we already know about (freshly created
+            # order in this same process). If we don't have it in memory --
+            # e.g. this view was recreated by resume_pending_payments after a
+            # restart, or _deliver ran from /product forcecheck -- fall back to
+            # fetching the order's stored message so a stale embed on Discord
+            # always catches up with what Firestore already knows.
+            message = self.message
+            if message is None and order.get('channelId') and order.get('messageId'):
+                try:
+                    channel = client.get_channel(int(order['channelId'])) or await client.fetch_channel(int(order['channelId']))
+                    message = await channel.fetch_message(int(order['messageId']))
+                except (discord.HTTPException, ValueError):
+                    message = None
 
-        self.stop()
+            if message:
+                try:
+                    embed = message.embeds[0]
+                    embed.set_field_at(1, name='Status', value='✅ Lunas -- produk dikirim ke DM', inline=True)
+                    await message.edit(embed=embed, view=self)
+                except discord.HTTPException:
+                    pass
+
+            self.stop()
 
     @discord.ui.button(label='Cek Pembayaran', style=discord.ButtonStyle.primary, emoji='🔄')
     async def check_now(self, interaction: discord.Interaction, button: discord.ui.Button):
