@@ -17,6 +17,7 @@ from utils.products import (
     bump_product_version,
     create_or_sync_product_type_forum,
     delete_product,
+    draw_stock_unit,
     get_product,
     get_products_by_ids,
     give_product_to_user,
