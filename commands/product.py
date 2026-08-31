@@ -101,14 +101,8 @@ def _parse_price_local(price_str) -> int:
     return int(digits) if digits else 0
 
 
-def _qr_image_url(order: dict) -> str | None:
-    """RamaShop returns qrImage as a hosted URL (api.qrserver.com), not a
-    base64 PNG like the old gateway -- so the embed just points its image
-    at that URL directly via set_image(), no discord.File/attachment
-    needed. Kept as a small helper (rather than inlining order['qrImageUrl']
-    everywhere) so a future gateway swap only needs to change this.
-    """
-    return order.get('qrImageUrl')
+def _gateway_payment_id(order: dict) -> str:
+    return order.get('gatewayDepositId') or '-'
 
 
 def _is_free_product(price) -> bool:
@@ -1496,21 +1490,21 @@ class ProductCog(commands.Cog):
             )
             return await interaction.followup.send('Failed to generate a QRIS payment. Please try again in a moment.')
 
-        # RamaShop matches paid deposits by exact transferred amount, so
-        # the buyer must pay totalAmount (product price + RamaShop's own
-        # unique code, e.g. Rp1.000 -> Rp1.073) -- NOT the bare product
-        # price. Showing `amount` here instead would mean every payment
-        # underpays by the unique code and never gets detected as paid.
         total_amount = order.get('totalAmount', amount)
-        qr_url = _qr_image_url(order)
 
-        embed = discord.Embed(title=f"Pay for {product['name']}", color=0x00B0F4)
+        # Format matches RamaShop's own `message` field convention exactly
+        # (comma thousands separator, e.g. "Rp 1,121"), just swapping the
+        # "(amount + kode unik X)" tail for the product name per spec.
+        embed = discord.Embed(
+            title=f"Silahkan bayar Rp {total_amount:,} untuk produk ({product['name']})",
+            color=0x00B0F4,
+        )
         embed.add_field(name='Total', value=_format_idr_local(total_amount), inline=True)
         embed.add_field(name='Status', value='⏳ Menunggu pembayaran', inline=True)
-        embed.add_field(name='Deposit ID', value=f"`{order.get('gatewayDepositId', '-')}`", inline=True)
+        embed.add_field(name='Deposit ID', value=f"`{_gateway_payment_id(order)}`", inline=True)
         embed.set_footer(text='Scan pakai e-wallet apa saja yang support QRIS. Transfer PERSIS nominal di atas (termasuk kode unik). Kadaluarsa dalam ~30 menit.')
-        if qr_url:
-            embed.set_image(url=qr_url)
+        if order.get('qrImageUrl'):
+            embed.set_image(url=order['qrImageUrl'])
 
         view = QRISPaymentView(order_id=order['orderId'], product=product, buyer_id=str(interaction.user.id))
         message = await interaction.followup.send(embed=embed, view=view, wait=True)
