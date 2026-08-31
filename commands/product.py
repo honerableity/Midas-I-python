@@ -1012,12 +1012,16 @@ class QRISPaymentView(discord.ui.View):
             for item in self.children:
                 item.disabled = True
 
+            print(f"[_deliver] {self.order_id}: starting delivery of {self.product['id']} to {self.buyer_id}")
+
             file_link = await draw_stock_unit(self.product['id'])
+            print(f"[_deliver] {self.order_id}: draw_stock_unit returned {file_link!r}")
 
             grant_failed = False
             try:
                 await give_product_to_user(self.product['id'], self.buyer_id)
                 await auto_whitelist_product_for_user(self.product['id'], self.buyer_id)
+                print(f"[_deliver] {self.order_id}: give_product_to_user + auto_whitelist done")
             except Exception as err:
                 # Paid orders must never fail silently here -- previously this
                 # was swallowed and the buyer was left with a "paid" order but
@@ -1027,7 +1031,7 @@ class QRISPaymentView(discord.ui.View):
                 grant_failed = True
                 self._delivered = False
                 _LIVE_QRIS_VIEWS[self.order_id] = self
-                print(f"Failed to grant product {self.product['id']} to {self.buyer_id} after payment: {err}")
+                print(f"[_deliver] {self.order_id}: FAILED to grant product {self.product['id']} to {self.buyer_id}: {err!r}")
             else:
                 await _post_auto_testimony(client, order.get('guildId'), self.buyer_id, [self.product['name']])
 
@@ -1040,22 +1044,26 @@ class QRISPaymentView(discord.ui.View):
                             f"Pembayaranmu untuk **{self.product['name']}** sudah diterima, tapi ada masalah teknis "
                             f"saat mengirim produknya. Jalankan `/product forcecheck` di ticket kamu, atau hubungi admin."
                         )
-                except discord.HTTPException:
-                    pass
+                except discord.HTTPException as err:
+                    print(f"[_deliver] {self.order_id}: couldn't DM grant-failed notice to {self.buyer_id}: {err!r}")
                 return
 
             buyer = client.get_user(int(self.buyer_id))
             if buyer is None:
                 try:
                     buyer = await client.fetch_user(int(self.buyer_id))
-                except discord.HTTPException:
+                except discord.HTTPException as err:
                     buyer = None
+                    print(f"[_deliver] {self.order_id}: couldn't fetch_user {self.buyer_id}: {err!r}")
+
+            print(f"[_deliver] {self.order_id}: buyer={buyer!r}, file_link={file_link!r} -- about to DM" if (buyer and file_link) else f"[_deliver] {self.order_id}: SKIPPING DM (buyer={buyer!r}, file_link={file_link!r})")
 
             if buyer and file_link:
                 try:
                     await buyer.send(**build_product_delivery_dm(self.product, file_link=file_link))
-                except discord.HTTPException:
-                    pass
+                    print(f"[_deliver] {self.order_id}: DM sent to {self.buyer_id}")
+                except discord.HTTPException as err:
+                    print(f"[_deliver] {self.order_id}: couldn't DM product to {self.buyer_id} (DMs likely closed): {err!r}")
 
             # Try to update the message we already know about (freshly created
             # order in this same process). If we don't have it in memory --
@@ -1068,16 +1076,20 @@ class QRISPaymentView(discord.ui.View):
                 try:
                     channel = client.get_channel(int(order['channelId'])) or await client.fetch_channel(int(order['channelId']))
                     message = await channel.fetch_message(int(order['messageId']))
-                except (discord.HTTPException, ValueError):
+                except (discord.HTTPException, ValueError) as err:
                     message = None
+                    print(f"[_deliver] {self.order_id}: couldn't fetch stored message to update embed: {err!r}")
 
             if message:
                 try:
                     embed = message.embeds[0]
                     embed.set_field_at(1, name='Status', value='✅ Lunas -- produk dikirim ke DM', inline=True)
                     await message.edit(embed=embed, view=self)
-                except discord.HTTPException:
-                    pass
+                    print(f"[_deliver] {self.order_id}: embed updated to Lunas")
+                except discord.HTTPException as err:
+                    print(f"[_deliver] {self.order_id}: couldn't edit embed to Lunas: {err!r}")
+            else:
+                print(f"[_deliver] {self.order_id}: no message available (self.message={self.message!r}) -- embed NOT updated")
 
             self.stop()
 
@@ -1100,8 +1112,35 @@ class QRISPaymentView(discord.ui.View):
         if not order:
             return await interaction.followup.send('Belum ada pembayaran yang terdeteksi. Coba lagi setelah selesai scan.', ephemeral=True)
 
-        await self._deliver(interaction.client, order)
-        await interaction.followup.send('✅ Pembayaran terkonfirmasi, produk sudah dikirim ke DM kamu!', ephemeral=True)
+        try:
+            await self._deliver(interaction.client, order)
+        except Exception as err:
+            # _deliver can raise from outside its own grant try/except (e.g.
+            # draw_stock_unit, the DM, the embed edit) -- previously that
+            # exception would propagate straight past this point and the
+            # line below would never run, EXCEPT discord.py's interaction
+            # error handler can itself swallow/log it in a way that's easy
+            # to miss, leaving the buyer with no visible response at all.
+            # Logging explicitly here + always telling the buyer something
+            # concrete removes the ambiguity.
+            print(f'[product buy] _deliver raised for order {self.order_id}: {err!r}')
+            return await interaction.followup.send(
+                'Pembayaranmu terverifikasi tapi ada error teknis saat mengirim produk. '
+                'Jalankan `/product forcecheck` di ticket ini, atau hubungi admin.',
+                ephemeral=True,
+            )
+
+        if self._delivered:
+            await interaction.followup.send('✅ Pembayaran terkonfirmasi, produk sudah dikirim ke DM kamu!', ephemeral=True)
+        else:
+            # _deliver returned without raising but grant_failed internally
+            # (self._delivered was reset to False) -- it already DMed the
+            # buyer about the technical issue itself, so just acknowledge
+            # here instead of claiming success.
+            await interaction.followup.send(
+                'Pembayaranmu terverifikasi, tapi ada kendala saat mengirim produk -- cek DM kamu untuk detailnya.',
+                ephemeral=True,
+            )
 
     async def on_timeout(self):
         # Not called in normal operation since timeout=None (this is a
