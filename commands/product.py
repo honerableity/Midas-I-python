@@ -1360,7 +1360,13 @@ class ProductCog(commands.Cog):
             embed.add_field(name='Testimoni', value=str(testi_count), inline=True)
 
         if not is_free:
-            embed.add_field(name='Link File', value=product['fileLink'], inline=False)
+            # Produk berbayar jangan pernah menampilkan URL file di forum/public post.
+            # Link file hanya dikirim setelah pembayaran berhasil dikonfirmasi.
+            embed.add_field(
+                name='Link File',
+                value='🔒 Tersedia setelah pembayaran berhasil dikonfirmasi.',
+                inline=False,
+            )
 
         review_media = product.get('reviewMedia') or ''
         if _IMAGE_URL_RE.search(review_media):
