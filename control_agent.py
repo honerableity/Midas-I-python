@@ -33,18 +33,20 @@ import time
 from collections import deque
 from pathlib import Path
 from typing import Optional
-from dotenv import load_dotenv
 
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 import uvicorn
 
+from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
+
+load_dotenv(dotenv_path=BASE_DIR / ".env", override=True)
 
 BOT_WORKDIR = Path(
     os.getenv("BOT_WORKDIR", str(BASE_DIR))
