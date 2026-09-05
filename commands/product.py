@@ -13,10 +13,7 @@ from discord.ext import commands
 
 from utils.logger import log_command_activity
 from utils.products import (
-    add_group_whitelist,
     add_stock_batch,
-    auto_revoke_product_for_user,
-    auto_whitelist_product_for_user,
     bump_product_version,
     create_or_sync_product_type_forum,
     delete_product,
@@ -30,7 +27,6 @@ from utils.products import (
     list_products_by_guild,
     list_products_by_type,
     product_version,
-    remove_group_whitelist,
     revoke_product_from_user,
     save_product,
     stock_summary_text,
@@ -72,8 +68,6 @@ LOG_SCHEMA = {
         'give': {'label': 'Product — Given', 'fields': ['discordUser', 'targetUser', 'productId', 'productName']},
         'revoke': {'label': 'Product — Revoked', 'fields': ['discordUser', 'targetUser', 'productId', 'productName']},
         'get': {'label': 'Product — File Link Requested', 'fields': ['discordUser', 'productId', 'productName']},
-        'groupwhitelistadd': {'label': 'Product — Group Whitelisted', 'fields': ['discordUser', 'productId', 'groupId']},
-        'groupwhitelistremove': {'label': 'Product — Group Whitelist Removed', 'fields': ['discordUser', 'productId', 'groupId']},
         'rating': {'label': 'Product — Rated', 'fields': ['discordUser', 'productId', 'productName', 'rating']},
         'settesticount': {'label': 'Product — Guild Testimony Count Edited', 'fields': ['discordUser', 'count']},
         'setreviewschannel': {'label': 'Product — Reviews Channel Set', 'fields': ['discordUser', 'reviewsChannel', 'modRole']},
@@ -859,10 +853,9 @@ _LIVE_QRIS_VIEWS: dict[str, 'QRISPaymentView'] = {}
 
 async def _post_auto_testimony(client: discord.Client, guild_id: str | None, buyer_id: str, product_names: list[str]):
     """Posts an automatic testimony embed to the guild's testimonial channel
-    right after a QRIS payment is confirmed and the product whitelist
-    succeeds. Silent no-op if no testimonial channel is configured
-    (/ticket settesti) or if it can't be resolved -- this should never
-    block product delivery.
+    right after a QRIS payment is confirmed and the product grant succeeds.
+    Silent no-op if no testimonial channel is configured (/ticket settesti)
+    or if it can't be resolved -- this should never block product delivery.
     """
     if not guild_id:
         return
@@ -1049,13 +1042,12 @@ class QRISPaymentView(discord.ui.View):
             grant_failed = False
             try:
                 await give_product_to_user(self.product['id'], self.buyer_id)
-                await auto_whitelist_product_for_user(self.product['id'], self.buyer_id)
-                print(f"[_deliver] {self.order_id}: give_product_to_user + auto_whitelist done")
+                print(f"[_deliver] {self.order_id}: give_product_to_user done")
             except Exception as err:
                 # Paid orders must never fail silently here -- previously this
                 # was swallowed and the buyer was left with a "paid" order but
-                # no product/whitelist and no error visible anywhere. Un-mark
-                # the delivery so /product forcecheck (or the poller/button)
+                # no product and no error visible anywhere. Un-mark the
+                # delivery so /product forcecheck (or the poller/button)
                 # retries the grant instead of treating this as done.
                 grant_failed = True
                 self._delivered = False
@@ -1545,7 +1537,6 @@ class ProductCog(commands.Cog):
             try:
                 file_link = await draw_stock_unit(product['id'])
                 await give_product_to_user(product['id'], str(interaction.user.id))
-                await auto_whitelist_product_for_user(product['id'], str(interaction.user.id))
             except Exception as err:
                 print(f'[product buy] free product delivery failed for {product["id"]}: {err!r}')
                 return await interaction.followup.send('Failed to deliver this free product. Please contact an admin.')
@@ -1670,7 +1661,6 @@ class ProductCog(commands.Cog):
         elif product:
             try:
                 await give_product_to_user(product['id'], confirmed['buyerId'])
-                await auto_whitelist_product_for_user(product['id'], confirmed['buyerId'])
             except Exception as err:
                 print(f"Failed to grant product {product['id']} to {confirmed['buyerId']} after forcecheck: {err}")
                 return await interaction.followup.send(
@@ -1784,21 +1774,12 @@ class ProductCog(commands.Cog):
             )
             return await interaction.followup.send('Gagal memberikan produk ke database. Coba lagi.')
 
-        auto_note = ''
-        try:
-            granted_group_ids = await auto_whitelist_product_for_user(product_id, str(user.id))
-            if granted_group_ids:
-                auto_note = f" Otomatis di-whitelist ke group yang sudah ditautkan: {', '.join(f'`{g}`' for g in granted_group_ids)}."
-        except Exception as err:
-            print(f'auto_whitelist_product_for_user failed (product still given): {err}')
-            auto_note = ' (Auto-whitelist ke group gagal, cek manual dengan /product groupwhitelist.)'
-
         await log_command_activity(
             interaction, subcommand='give', success=True,
             fields={'discordUser': interaction.user, 'targetUser': user, 'productId': product_id, 'productName': product['name']},
         )
 
-        await interaction.followup.send(f"Produk **{product['name']}** berhasil diberikan ke {user.mention}.{auto_note}")
+        await interaction.followup.send(f"Produk **{product['name']}** berhasil diberikan ke {user.mention}.")
 
     @product_group.command(name='revoke', description='Revoke a product from a user')
     @app_commands.describe(user='Target user', product_uuid='ID produk (UUID)')
@@ -1840,64 +1821,12 @@ class ProductCog(commands.Cog):
             )
             return await interaction.followup.send('Gagal mencabut produk dari database. Coba lagi.')
 
-        auto_note = ''
-        try:
-            removed_group_ids = await auto_revoke_product_for_user(product_id, str(user.id))
-            if removed_group_ids:
-                auto_note = f" Whitelist otomatis ke group juga dicabut: {', '.join(f'`{g}`' for g in removed_group_ids)}."
-        except Exception as err:
-            print(f'auto_revoke_product_for_user failed (product still revoked): {err}')
-            auto_note = ' (Gagal auto-cabut whitelist group, cek manual dengan /product groupwhitelist.)'
-
         await log_command_activity(
             interaction, subcommand='revoke', success=True,
             fields={'discordUser': interaction.user, 'targetUser': user, 'productId': product_id, 'productName': product['name']},
         )
 
-        await interaction.followup.send(f"Produk **{product['name']}** berhasil dicabut dari {user.mention}.{auto_note}")
-
-    @product_group.command(name='groupwhitelist', description='Whitelist a product for use by ANY member of a Roblox group who has linked it')
-    @app_commands.describe(product_uuid='ID produk (UUID)', group_id='Roblox group ID (numeric)', action='add or remove')
-    @app_commands.choices(action=[
-        app_commands.Choice(name='add', value='add'),
-        app_commands.Choice(name='remove', value='remove'),
-    ])
-    @app_commands.autocomplete(product_uuid=_autocomplete_any_product_uuid)
-    async def groupwhitelist(self, interaction: discord.Interaction, product_uuid: str, group_id: str, action: app_commands.Choice[str]):
-        if not await self._guild_check(interaction):
-            return
-        if not _require_admin(interaction):
-            return await _admin_denied(interaction)
-
-        await interaction.response.defer(ephemeral=True)
-
-        product_id = product_uuid.strip()
-        group_id = group_id.strip()
-
-        if not group_id.isdigit():
-            return await interaction.followup.send('Group ID harus berupa angka.')
-
-        product = await get_product(product_id)
-        if not product:
-            return await interaction.followup.send(f'Produk dengan ID `{product_id}` tidak ditemukan.')
-
-        sub = 'groupwhitelistadd' if action.value == 'add' else 'groupwhitelistremove'
-
-        if action.value == 'add':
-            await add_group_whitelist(product_id, group_id)
-            verb = 'sekarang bisa dipakai oleh'
-        else:
-            await remove_group_whitelist(product_id, group_id)
-            verb = 'tidak lagi bisa dipakai oleh'
-
-        await log_command_activity(
-            interaction, subcommand=sub, success=True,
-            fields={'discordUser': interaction.user, 'productId': product_id, 'groupId': group_id},
-        )
-        await interaction.followup.send(
-            f"Produk **{product['name']}** {verb} anggota group `{group_id}` yang sudah `/verify linkgroup` "
-            f"-- di place manapun yang dimiliki group itu, selama mereka masih anggotanya."
-        )
+        await interaction.followup.send(f"Produk **{product['name']}** berhasil dicabut dari {user.mention}.")
 
     @product_group.command(name='get', description='Get the file link of a product you own, sent to your DM')
     @app_commands.describe(product_uuid='ID produk (UUID)')
