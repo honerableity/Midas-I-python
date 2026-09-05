@@ -1,10 +1,19 @@
-"""/verify command -- Roblox account verification.
+"""/verify command -- Roblox OAuth2 account verification.
 
-Ported from commands/verify.js.
+Old flow: bot generates a code -> user pastes it into their Roblox profile
+description -> bot polls the description via the public users API.
+
+New flow: bot generates a signed `state` -> user is DM'd a link button
+straight to Roblox's OAuth consent screen (scopes: openid, profile,
+group:read) -> Roblox redirects to our Vercel /api/callback, which
+exchanges the code, calls userinfo, and flips the Firestore session doc
+to "authorized" -> user comes back to Discord and clicks "I've
+authorized", which is when we actually assign the role.
+
+Nothing here ever touches a Roblox password/cookie, and the bot process
+never has to run its own public HTTP endpoint -- Vercel already has one
+for /api/validate, so the callback just lives next to it.
 """
-import asyncio
-import time
-
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -12,21 +21,16 @@ from discord.ext import commands
 from utils.logger import log_command_activity
 from utils.products import get_products_by_ids
 from utils.verification import (
-    EXPIRY_MS,
+    build_authorize_url,
     clear_session,
     create_session,
-    description_contains_code,
-    fetch_roblox_description,
     fetch_roblox_profile_details,
-    fetch_user_group_ids,
     get_guild_config,
     get_session,
     get_verified_user,
-    link_group,
     remove_verified_user,
     save_verified_user,
     set_guild_role,
-    unlink_group,
 )
 
 COMMAND_NAME = 'verify'
@@ -38,15 +42,13 @@ LOG_SCHEMA = {
         'unverify': {'label': 'Verify — Unverify', 'fields': ['discordUser', 'robloxUsername']},
         'profile': {'label': 'Verify — Profile Lookup', 'fields': ['discordUser', 'targetUser']},
         'verifyComplete': {'label': 'Verify — Completed', 'fields': ['discordUser', 'robloxUsername']},
-        'linkgroup': {'label': 'Verify — Group Linked', 'fields': ['discordUser', 'groupId']},
-        'unlinkgroup': {'label': 'Verify — Group Unlinked', 'fields': ['discordUser', 'groupId']},
         'sendpanel': {'label': 'Verify — Panel Sent', 'fields': ['discordUser', 'channel']},
     },
 }
 
 
 def _paginate_list_field(embed: discord.Embed, label: str, items: list[str], page: int, page_size: int):
-    total_pages = max(1, -(-len(items) // page_size))  # ceil div
+    total_pages = max(1, -(-len(items) // page_size))
     clamped_page = min(page, total_pages - 1)
     start = clamped_page * page_size
     chunk = items[start:start + page_size]
@@ -56,7 +58,7 @@ def _paginate_list_field(embed: discord.Embed, label: str, items: list[str], pag
 
 
 # ---------------------------------------------------------------------------
-# /verify unverify -- confirm-via-modal flow
+# /verify unverify -- confirm-via-modal flow (unchanged)
 # ---------------------------------------------------------------------------
 class UnverifyModal(discord.ui.Modal, title='Confirm Unverify'):
     roblox_username = discord.ui.TextInput(
@@ -109,7 +111,7 @@ class UnverifyModal(discord.ui.Modal, title='Confirm Unverify'):
 
 
 # ---------------------------------------------------------------------------
-# /verify profile -- tabbed, paginated profile card
+# /verify profile -- tabbed, paginated profile card (unchanged)
 # ---------------------------------------------------------------------------
 class ProfileView(discord.ui.View):
     PAGE_SIZE = 10
@@ -170,7 +172,6 @@ class ProfileView(discord.ui.View):
             items = [f'{p["name"]} — {p["price"]}' for p in self.owned_products]
             return _paginate_list_field(embed, 'Owned Products', items, self.page, self.PAGE_SIZE)
 
-        # account tab
         verified_at = self.record.get('verifiedAt')
         verified_at_str = f'<t:{int(verified_at / 1000)}:F>' if verified_at else 'Unknown'
         embed.add_field(name='Roblox ID', value=str(self.record.get('robloxId')), inline=True)
@@ -192,7 +193,7 @@ class ProfileView(discord.ui.View):
 
             async def _tab_cb(interaction: discord.Interaction, key=tab_key):
                 self.tab = key
-                self.page = 0  # reset page on tab switch
+                self.page = 0
                 self._build_components()
                 await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
@@ -237,125 +238,111 @@ class ProfileView(discord.ui.View):
 
 
 # ---------------------------------------------------------------------------
-# /verify start -- DM verify button -> modal -> Roblox description check
+# /verify start -- DM with a Roblox OAuth link button + "I've authorized"
+# check-status button
 # ---------------------------------------------------------------------------
-class VerifyDMButtonView(discord.ui.View):
-    def __init__(self, *, discord_user_id: int, guild_id: int, source_interaction: discord.Interaction):
-        super().__init__(timeout=EXPIRY_MS / 1000)
+class VerifyDMView(discord.ui.View):
+    """Two buttons: a link button straight to Roblox's consent screen
+    (no callback needed -- Discord opens link buttons directly), and a
+    regular button the user clicks after approving, which is the only
+    point where the bot actually reads the session back and assigns the
+    role.
+    """
+
+    def __init__(self, *, discord_user_id: int, guild_id: int, authorize_url: str, source_interaction: discord.Interaction):
+        super().__init__(timeout=None)  # session doc itself carries the real expiry
         self.discord_user_id = discord_user_id
         self.guild_id = guild_id
         self.source_interaction = source_interaction
-        self.verified = False
 
-    @discord.ui.button(label='Verify!', style=discord.ButtonStyle.success, custom_id='verify_button')
-    async def verify_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        modal = VerifyUsernameModal(
-            discord_user_id=self.discord_user_id,
-            guild_id=self.guild_id,
-            source_interaction=self.source_interaction,
-            dm_view=self,
+        self.add_item(discord.ui.Button(
+            label='Continue with Roblox',
+            style=discord.ButtonStyle.link,
+            url=authorize_url,
+            emoji='🔗',
+        ))
+
+        check_btn = discord.ui.Button(
+            label="I've authorized",
+            style=discord.ButtonStyle.success,
+            custom_id='verify_check_status',
         )
-        await interaction.response.send_modal(modal)
+        check_btn.callback = self._on_check_status
+        self.add_item(check_btn)
 
-    async def on_timeout(self):
-        if self.verified:
-            return  # already handled
-        await clear_session(str(self.discord_user_id))
-        try:
-            user = self.source_interaction.client.get_user(self.discord_user_id)
-            if user:
-                await user.send('Your verification code expired without completing verification. Run `/verify start` again to get a new code.')
-        except discord.HTTPException:
-            pass
-
-
-class VerifyUsernameModal(discord.ui.Modal, title='Roblox Verification'):
-    roblox_username = discord.ui.TextInput(label='Your Roblox Username', style=discord.TextStyle.short, required=True)
-
-    def __init__(self, *, discord_user_id: int, guild_id: int, source_interaction: discord.Interaction, dm_view: VerifyDMButtonView):
-        super().__init__()
-        self.discord_user_id = discord_user_id
-        self.guild_id = guild_id
-        self.source_interaction = source_interaction
-        self.dm_view = dm_view
-
-    async def on_submit(self, interaction: discord.Interaction):
-        username = self.roblox_username.value.strip()
+    async def _on_check_status(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
+        await _finish_verification(interaction, self.discord_user_id, self.guild_id, self.source_interaction)
 
-        session = await get_session(str(self.discord_user_id))
-        if not session or time.time() * 1000 > session['expiresAt']:
-            return await interaction.followup.send("Your verification code expired. Run `/verify start` again.")
 
-        try:
-            profile = await fetch_roblox_description(username)
-        except Exception:  # noqa: BLE001
-            return await interaction.followup.send('Bot error while contacting Roblox. Try again later.')
+async def _finish_verification(interaction: discord.Interaction, discord_user_id: int, guild_id: int, source_interaction: discord.Interaction):
+    session = await get_session(str(discord_user_id))
 
-        if profile.get('notFound'):
-            return await interaction.followup.send('That Roblox username was not found. Check spelling and try again.')
-
-        if not description_contains_code(profile['description'], session['code']):
-            return await interaction.followup.send(
-                f"Code not found in your Roblox profile description yet. Make sure `{session['code']}` "
-                f"is pasted in your About section, then click Verify! again."
-            )
-
-        # success
-        client = interaction.client
-        guild = client.get_guild(self.guild_id) or await client.fetch_guild(self.guild_id)
-        member = guild.get_member(self.discord_user_id) or await guild.fetch_member(self.discord_user_id)
-        cfg = await get_guild_config(str(self.guild_id))
-
-        if not cfg or not cfg.get('verifiedRoleId'):
-            return await interaction.followup.send('Bot error: verified role is no longer configured.')
-
-        role = guild.get_role(int(cfg['verifiedRoleId']))
-        if role is None:
-            return await interaction.followup.send('Bot error: verified role is no longer configured.')
-
-        try:
-            await member.add_roles(role)
-        except discord.HTTPException as role_err:
-            print(f'Role assign failed: {role_err}')
-            return await interaction.followup.send('Bot error: could not assign role. Check my role position/permissions.')
-
-        try:
-            await save_verified_user(
-                str(self.discord_user_id),
-                roblox_id=profile['robloxId'],
-                roblox_username=profile['robloxUsername'],
-                guild_id=str(self.guild_id),
-            )
-        except Exception as save_err:  # noqa: BLE001
-            print(f'save_verified_user failed (role already assigned): {save_err}')
-
-        await clear_session(str(self.discord_user_id))
-        self.dm_view.verified = True
-        self.dm_view.stop()
-
-        await log_command_activity(
-            self.source_interaction,
-            subcommand='verifyComplete',
-            success=True,
-            fields={'discordUser': interaction.user, 'robloxUsername': profile['robloxUsername']},
+    if not session:
+        return await interaction.followup.send(
+            'Your verification session expired. Run `/verify start` again to get a new link.',
+            ephemeral=True,
         )
 
-        return await interaction.followup.send(f"Verified! You're linked as **{profile['robloxUsername']}**. Role assigned.")
+    if session['status'] == 'pending':
+        return await interaction.followup.send(
+            "Looks like you haven't finished authorizing on Roblox yet -- click **Continue with Roblox** "
+            "above, approve the request, then come back and click this button again.",
+            ephemeral=True,
+        )
+
+    if session['status'] != 'authorized':
+        return await interaction.followup.send('Something went wrong with your verification. Run `/verify start` again.', ephemeral=True)
+
+    client = interaction.client
+    guild = client.get_guild(guild_id) or await client.fetch_guild(guild_id)
+    member = guild.get_member(discord_user_id) or await guild.fetch_member(discord_user_id)
+    cfg = await get_guild_config(str(guild_id))
+
+    if not cfg or not cfg.get('verifiedRoleId'):
+        return await interaction.followup.send('Bot error: verified role is no longer configured for that server.', ephemeral=True)
+
+    role = guild.get_role(int(cfg['verifiedRoleId']))
+    if role is None:
+        return await interaction.followup.send('Bot error: verified role is no longer configured for that server.', ephemeral=True)
+
+    try:
+        await member.add_roles(role)
+    except discord.HTTPException as role_err:
+        print(f'Role assign failed: {role_err}')
+        return await interaction.followup.send('Bot error: could not assign role. Check my role position/permissions.', ephemeral=True)
+
+    try:
+        await save_verified_user(
+            str(discord_user_id),
+            roblox_id=session['robloxId'],
+            roblox_username=session['robloxUsername'],
+            guild_id=str(guild_id),
+        )
+    except Exception as save_err:  # noqa: BLE001
+        print(f'save_verified_user failed (role already assigned): {save_err}')
+
+    await clear_session(str(discord_user_id))
+
+    await log_command_activity(
+        source_interaction,
+        subcommand='verifyComplete',
+        success=True,
+        fields={'discordUser': interaction.user, 'robloxUsername': session['robloxUsername']},
+    )
+
+    return await interaction.followup.send(f"Verified! You're linked as **{session['robloxUsername']}**. Role assigned.", ephemeral=True)
 
 
 async def _run_verify_start(interaction: discord.Interaction):
-    """Shared body for /verify start and the green button on the verify
-    panel (/verify sendpanel). Panel button interactions don't go through
-    the slash-command tree, so this must be self-contained and not assume
-    it's a slash command context.
+    """Shared body for /verify start and the button on the verify panel
+    (/verify sendpanel). Panel button interactions don't go through the
+    slash-command tree, so this must be self-contained.
 
-    Every response here is explicitly ephemeral=True. Deferring with
-    ephemeral=True only makes the initial "thinking" state ephemeral --
-    subsequent interaction.followup.send() calls do NOT inherit that and
-    need ephemeral=True passed on each one, or they end up posting publicly
-    in the panel's channel. That matters a lot here specifically, since the
-    whole point of the panel is to keep its channel clean.
+    Every response here is ephemeral=True -- deferring with
+    ephemeral=True only makes the initial "thinking" state ephemeral,
+    subsequent followups need it passed explicitly, or they post
+    publicly in the panel's channel.
     """
     if interaction.guild is None:
         return await interaction.response.send_message('This command only works inside a server.', ephemeral=True)
@@ -376,32 +363,37 @@ async def _run_verify_start(interaction: discord.Interaction):
     existing = await get_session(str(interaction.user.id))
     if existing:
         return await interaction.followup.send(
-            f"You already have an active verification code. Check your DMs, or wait "
+            f"You already have an active verification link. Check your DMs, or wait "
             f"<t:{int(existing['expiresAt'] / 1000)}:R> for it to expire before starting over.",
             ephemeral=True,
         )
 
     await interaction.followup.send('Check your DMs! 📬', ephemeral=True)
 
-    session = await create_session(str(interaction.user.id))
-    code, expires_at = session['code'], session['expiresAt']
+    session = await create_session(str(interaction.user.id), str(interaction.guild_id))
+    authorize_url = build_authorize_url(session['state'])
 
     embed = discord.Embed(
         title='Roblox Verification',
         description=(
-            f'Copy this code and paste it anywhere in your Roblox profile **About/Description**:\n\n'
-            f'```{code}```\n'
-            f'This code expires <t:{int(expires_at / 1000)}:R>.\n\n'
-            f"Once it's on your profile, click **Verify!** below."
+            "Click **Continue with Roblox** below and approve the request. Roblox will ask to share "
+            "your username, profile, and group memberships with this bot -- nothing else, and we never "
+            "see your password.\n\n"
+            f"Once you've approved it, come back here and click **I've authorized**.\n\n"
+            f"This link expires <t:{int(session['expiresAt'] / 1000)}:R>."
         ),
         color=0x00B0F4,
     )
 
-    view = VerifyDMButtonView(discord_user_id=interaction.user.id, guild_id=interaction.guild_id, source_interaction=interaction)
+    view = VerifyDMView(
+        discord_user_id=interaction.user.id,
+        guild_id=interaction.guild_id,
+        authorize_url=authorize_url,
+        source_interaction=interaction,
+    )
 
     try:
-        dm = await interaction.user.send(embed=embed, view=view)
-        view.message = dm
+        await interaction.user.send(embed=embed, view=view)
     except discord.HTTPException:
         return await interaction.followup.send(
             'Could not DM you. Please enable DMs from server members and run `/verify start` again.',
@@ -412,8 +404,8 @@ async def _run_verify_start(interaction: discord.Interaction):
 
 
 # ---------------------------------------------------------------------------
-# /verify sendpanel -- persistent panel embed with a green "Verify!" button
-# that runs the same logic as /verify start. Modelled on /ticket send.
+# /verify sendpanel -- persistent panel embed with a "Verify!" button that
+# runs the same logic as /verify start.
 # ---------------------------------------------------------------------------
 CID_VERIFY_PANEL_BTN = 'verify_panel_start'
 
@@ -470,7 +462,7 @@ class VerifyCog(commands.Cog):
 
     verify_group = app_commands.Group(name='verify', description='Verify your Roblox account')
 
-    @verify_group.command(name='start', description='Start Roblox verification (DMs you a code)')
+    @verify_group.command(name='start', description='Start Roblox verification (DMs you a link)')
     async def start(self, interaction: discord.Interaction):
         await _run_verify_start(interaction)
 
@@ -487,6 +479,7 @@ class VerifyCog(commands.Cog):
             return await interaction.response.send_message(f"I can't send messages in {channel.mention}. Check my permissions there.", ephemeral=True)
 
         await interaction.response.send_modal(SendVerifyPanelModal(interaction, channel))
+
     @verify_group.command(name='setrole', description='Set the role given after verification')
     @app_commands.describe(role='Role to assign on verify')
     async def setrole(self, interaction: discord.Interaction, role: discord.Role):
@@ -510,67 +503,6 @@ class VerifyCog(commands.Cog):
         # showModal() must be the very first thing that happens on this
         # interaction -- no Firestore read before it.
         await interaction.response.send_modal(UnverifyModal(source_interaction=interaction))
-
-    @verify_group.command(name='linkgroup', description='Link a Roblox group you belong to, so its places can use your whitelisted products')
-    @app_commands.describe(group_id='Roblox group ID (numeric)')
-    async def linkgroup(self, interaction: discord.Interaction, group_id: str):
-        await interaction.response.defer(ephemeral=True)
-
-        group_id = group_id.strip()
-        if not group_id.isdigit():
-            return await interaction.followup.send('Group ID harus berupa angka. Contoh: `12345678`.')
-
-        record = await get_verified_user(str(interaction.user.id))
-        if not record:
-            await log_command_activity(
-                interaction, subcommand='linkgroup', success=False,
-                fields={'discordUser': interaction.user, 'groupId': group_id}, note='User is not verified.',
-            )
-            return await interaction.followup.send('Kamu harus verifikasi akun Roblox dulu lewat `/verify start`.')
-
-        try:
-            member_group_ids = await fetch_user_group_ids(record['robloxId'])
-        except Exception as err:  # noqa: BLE001
-            print(f'fetch_user_group_ids failed: {err}')
-            await log_command_activity(
-                interaction, subcommand='linkgroup', success=False,
-                fields={'discordUser': interaction.user, 'groupId': group_id}, note='Roblox groups API call failed.',
-            )
-            return await interaction.followup.send('Gagal mengambil daftar group Roblox kamu. Coba lagi nanti.')
-
-        if group_id not in member_group_ids:
-            await log_command_activity(
-                interaction, subcommand='linkgroup', success=False,
-                fields={'discordUser': interaction.user, 'groupId': group_id}, note='User is not a member of that group.',
-            )
-            return await interaction.followup.send(
-                f'Akun Roblox kamu (**{record["robloxUsername"]}**) bukan anggota group `{group_id}`. '
-                f'Pastikan kamu sudah join group itu, baru jalankan lagi.'
-            )
-
-        await link_group(str(interaction.user.id), group_id)
-        await log_command_activity(
-            interaction, subcommand='linkgroup', success=True,
-            fields={'discordUser': interaction.user, 'groupId': group_id},
-        )
-        await interaction.followup.send(
-            f'Group `{group_id}` berhasil ditautkan ke akunmu. Produk yang di-whitelist ke group ini sekarang bisa '
-            f'kamu pakai di place manapun yang dimiliki group tersebut -- selama kamu masih jadi anggotanya. '
-            f'Kalau kamu keluar dari group, akses ini otomatis hilang.'
-        )
-
-    @verify_group.command(name='unlinkgroup', description='Unlink a previously linked Roblox group')
-    @app_commands.describe(group_id='Roblox group ID (numeric)')
-    async def unlinkgroup(self, interaction: discord.Interaction, group_id: str):
-        await interaction.response.defer(ephemeral=True)
-
-        group_id = group_id.strip()
-        await unlink_group(str(interaction.user.id), group_id)
-        await log_command_activity(
-            interaction, subcommand='unlinkgroup', success=True,
-            fields={'discordUser': interaction.user, 'groupId': group_id},
-        )
-        await interaction.followup.send(f'Group `{group_id}` sudah dilepas dari akunmu.')
 
     @verify_group.command(name='profile', description="Look up a member's linked Roblox profile")
     @app_commands.describe(user='Discord user to look up')
@@ -611,6 +543,4 @@ class VerifyCog(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(VerifyCog(bot))
-    # Register the persistent panel view so its button keeps working after a
-    # bot restart, same pattern as TicketPanelView in commands/ticket.py.
     bot.add_view(VerifyPanelView())
