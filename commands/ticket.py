@@ -205,15 +205,6 @@ class TicketPanelView(discord.ui.View):
         if category == 'clickme':
             return await interaction.response.edit_message(view=TicketPanelView())
 
-        # Panel components bypass the slash-command tree's interaction_check,
-        # so the verification gate is re-applied here explicitly.
-        verified_record = await get_verified_user(str(interaction.user.id))
-        if not verified_record:
-            return await interaction.response.send_message(
-                '🔒 You need to verify your Roblox account before opening a ticket. Run `/verify start` first.',
-                ephemeral=True,
-            )
-
         handler = {
             'order': self._handle_order,
             'service': self._handle_service,
