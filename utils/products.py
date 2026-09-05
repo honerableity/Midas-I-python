@@ -192,8 +192,8 @@ async def list_products_by_type(guild_id: str, type_id: str):
 
 async def list_products_by_guild(guild_id: str):
     """All products in a guild, across every type. Used for admin-facing
-    autocomplete (edit/delete/give/revoke/sendpost/groupwhitelist) where any
-    product could be the target, not just ones the invoking user owns.
+    autocomplete (edit/delete/give/revoke/sendpost) where any product could
+    be the target, not just ones the invoking user owns.
     """
     query = db.collection('products').where('guildId', '==', guild_id)
     return [{'id': doc.id, **doc.to_dict()} for doc in query.stream()]
@@ -408,81 +408,6 @@ async def draw_stock_unit(product_id: str) -> str | None:
 
     transaction = db.transaction()
     return _txn(transaction)
-
-
-
-def _group_whitelist_doc_id(product_id: str, group_id: str) -> str:
-    return f'{product_id}_{group_id}'
-
-
-async def add_group_whitelist(product_id: str, group_id: str, *, auto_granted: bool = False):
-    """Grants product_id to any verified user who has linked group_id to
-    their account (via /verify linkgroup) and is still a member of it --
-    membership is re-checked live by the validate API, not cached here.
-
-    auto_granted marks this grant as having been created automatically
-    (by /product give or a ticket order being marked done) rather than by
-    an admin running /product groupwhitelist directly. This lets the
-    auto-revoke path (see remove_auto_group_whitelists_for_user below)
-    clean up only what it granted, without touching grants an admin made
-    on purpose for unrelated reasons.
-    """
-    doc_ref = db.collection('productGroupWhitelists').document(_group_whitelist_doc_id(product_id, group_id))
-    data = {
-        'productId': product_id,
-        'groupId': str(group_id),
-        'createdAt': _now_ms(),
-    }
-    if auto_granted:
-        existing = doc_ref.get()
-        if not existing.exists:
-            data['autoGranted'] = True
-    doc_ref.set(data, merge=True)
-
-
-async def remove_group_whitelist(product_id: str, group_id: str):
-    db.collection('productGroupWhitelists').document(_group_whitelist_doc_id(product_id, group_id)).delete()
-
-
-async def auto_whitelist_product_for_user(product_id: str, discord_id: str):
-    """Called right after a product is granted to a verified user (via
-    /product give or a completed ticket order). Auto-whitelists the
-    product to every Roblox group that user currently has linked, so it
-    becomes usable in that group's places without an admin having to run
-    /product groupwhitelist manually for each one.
-
-    No-op if the user has no linked groups yet -- they'll just have plain
-    ownership until they /verify linkgroup and an admin (or a future
-    give/order) triggers this again.
-    """
-    user_doc = db.collection('verifiedUsers').document(discord_id).get()
-    if not user_doc.exists:
-        return []
-    linked_group_ids = (user_doc.to_dict() or {}).get('linkedGroupIds') or []
-    for group_id in linked_group_ids:
-        await add_group_whitelist(product_id, group_id, auto_granted=True)
-    return linked_group_ids
-
-
-async def auto_revoke_product_for_user(product_id: str, discord_id: str):
-    """Called right after a product is revoked from a verified user. Removes
-    ONLY the auto-granted group whitelists this product/user pair produced
-    (autoGranted=True) -- a group whitelist an admin set up on purpose via
-    /product groupwhitelist is left alone, since other members of that group
-    may still be relying on it.
-    """
-    user_doc = db.collection('verifiedUsers').document(discord_id).get()
-    if not user_doc.exists:
-        return []
-    linked_group_ids = (user_doc.to_dict() or {}).get('linkedGroupIds') or []
-    removed = []
-    for group_id in linked_group_ids:
-        doc_ref = db.collection('productGroupWhitelists').document(_group_whitelist_doc_id(product_id, group_id))
-        doc = doc_ref.get()
-        if doc.exists and doc.to_dict().get('autoGranted'):
-            doc_ref.delete()
-            removed.append(group_id)
-    return removed
 
 
 _URL_RE = re.compile(r'^https?://', re.IGNORECASE)
