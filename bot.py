@@ -1,8 +1,8 @@
 """Main bot entrypoint.
 
-Loads env, boots discord.py Client w/ command tree,
-loads every commands/*.py as an extension, wires honeypot message listener,
-starts expiry scanner on ready.
+Loads env, boots discord.py Client w/ command tree, loads every
+commands/*.py as an extension, wires honeypot message listener, starts
+expiry scanner on ready.
 """
 import asyncio
 import os
@@ -97,6 +97,12 @@ class VerificationGatedTree(app_commands.CommandTree):
 
 bot = commands.Bot(command_prefix='!', intents=intents, tree_cls=VerificationGatedTree)
 
+# Guards against double-registering the Firestore verify listener if
+# on_ready ever fires more than once (discord.py calls it again on
+# reconnect after a dropped gateway session). start_verify_listener()
+# itself doesn't dedupe internally, so this flag is what makes it safe.
+_verify_listener_started = False
+
 
 @bot.event
 async def setup_hook():
@@ -129,6 +135,12 @@ async def on_ready():
         await resume_pending_payments(bot)
     except Exception as err:
         print(f'[product] resume_pending_payments failed: {err}')
+
+    global _verify_listener_started
+    if not _verify_listener_started:
+        from utils.verify_listener import start_verify_listener
+        start_verify_listener(bot)
+        _verify_listener_started = True
 
 
 @bot.event
