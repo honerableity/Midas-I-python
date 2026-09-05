@@ -97,11 +97,12 @@ class VerificationGatedTree(app_commands.CommandTree):
 
 bot = commands.Bot(command_prefix='!', intents=intents, tree_cls=VerificationGatedTree)
 
-# Guards against double-registering the Firestore verify listener if
-# on_ready ever fires more than once (discord.py calls it again on
-# reconnect after a dropped gateway session). start_verify_listener()
-# itself doesn't dedupe internally, so this flag is what makes it safe.
+# Guards against double-registering the Firestore listeners if on_ready
+# ever fires more than once (discord.py calls it again on reconnect
+# after a dropped gateway session). Neither listener dedupes itself, so
+# these flags are what make repeated on_ready calls safe.
 _verify_listener_started = False
+_altcheck_listener_started = False
 
 
 @bot.event
@@ -136,11 +137,16 @@ async def on_ready():
     except Exception as err:
         print(f'[product] resume_pending_payments failed: {err}')
 
-    global _verify_listener_started
+    global _verify_listener_started, _altcheck_listener_started
     if not _verify_listener_started:
         from utils.verify_listener import start_verify_listener
         start_verify_listener(bot)
         _verify_listener_started = True
+
+    if not _altcheck_listener_started:
+        from utils.altcheck_listener import start_altcheck_listener
+        start_altcheck_listener(bot)
+        _altcheck_listener_started = True
 
 
 @bot.event
