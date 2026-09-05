@@ -6,9 +6,12 @@ Flow:
   2. Discord redirects to our Vercel /api/callback, which exchanges the
      code, confirms the authorizing user really is this discordId, and
      flips the session to "oauth_done".
-  3. User comes back to Discord, clicks "Continue" -> sees the rules ->
-     clicks "I agree" -> session flips to "rules_agreed" and the role is
-     assigned immediately (no external platform to check anymore).
+  3. utils/verify_listener.py is watching Firestore for that flip and
+     immediately DMs the user the rules -> they click "I agree" ->
+     session flips to "rules_agreed" and the role is assigned right
+     away. There is no "Continue" button anymore -- step 3 fires on its
+     own the instant oauth_done is written, no action needed in Discord
+     between authorizing and seeing the rules.
 
 Roblox-specific commands (/verify profile, /verify linkgroup, etc.) are
 gone -- there's no external identity left to look up.
@@ -50,6 +53,8 @@ DEFAULT_RULES_TEXT = (
     "By verifying you agree to follow this server's rules, be respectful to other "
     "members, and follow Discord's Terms of Service and Community Guidelines."
 )
+
+EXPIRY_MS_TIMEOUT = 15 * 60  # seconds, matches the session's own expiry
 
 
 # ---------------------------------------------------------------------------
@@ -104,68 +109,19 @@ class UnverifyConfirmView(discord.ui.View):
 
 
 # ---------------------------------------------------------------------------
-# /verify start -- DM: OAuth link button -> "Continue" -> rules -> "I agree"
+# Rules step -- sent automatically by utils/verify_listener.py the moment
+# Firestore flips a session to "oauth_done". Can also, in principle, be
+# constructed from a live interaction, so source_interaction is optional:
+# it's only used for activity logging and is simply skipped when absent.
 # ---------------------------------------------------------------------------
-class VerifyDMView(discord.ui.View):
-    """Step 1: a link button straight to Discord's own consent screen,
-    plus a regular button ("Continue") the user clicks after approving.
-    Clicking Continue is the only point where the bot reads the session
-    back; if it's ready, it swaps this message's view for the rules step.
-    """
-
-    def __init__(self, *, discord_user_id: int, guild_id: int, authorize_url: str, source_interaction: discord.Interaction):
-        super().__init__(timeout=None)  # session doc itself carries the real expiry
-        self.discord_user_id = discord_user_id
-        self.guild_id = guild_id
-        self.source_interaction = source_interaction
-
-        self.add_item(discord.ui.Button(
-            label='Authorize with Discord',
-            style=discord.ButtonStyle.link,
-            url=authorize_url,
-            emoji='🔗',
-        ))
-
-        continue_btn = discord.ui.Button(label='Continue', style=discord.ButtonStyle.success, custom_id='verify_continue')
-        continue_btn.callback = self._on_continue
-        self.add_item(continue_btn)
-
-    async def _on_continue(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-
-        session = await get_session(str(self.discord_user_id))
-        if not session:
-            return await interaction.followup.send(
-                'Your verification session expired. Run `/verify start` again to get a new link.',
-                ephemeral=True,
-            )
-
-        if session['status'] == 'pending':
-            return await interaction.followup.send(
-                "Looks like you haven't finished authorizing yet -- click **Authorize with Discord** "
-                "above, approve it, then come back and click **Continue** again.",
-                ephemeral=True,
-            )
-
-        # oauth_done or rules_agreed both mean the OAuth step is done --
-        # show the rules regardless so unverify+reverify always re-shows them.
-        config = await get_guild_config(str(self.guild_id))
-        rules_text = (config or {}).get('rulesText') or DEFAULT_RULES_TEXT
-
-        embed = discord.Embed(title='Server Rules', description=rules_text, color=0x00B0F4)
-        view = RulesAgreeView(
-            discord_user_id=self.discord_user_id,
-            guild_id=self.guild_id,
-            source_interaction=self.source_interaction,
-        )
-        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
-
-
 class RulesAgreeView(discord.ui.View):
-    def __init__(self, *, discord_user_id: int, guild_id: int, source_interaction: discord.Interaction):
+    def __init__(self, *, discord_user_id: int, guild_id: int, source_interaction: discord.Interaction | None = None):
         super().__init__(timeout=EXPIRY_MS_TIMEOUT)
         self.discord_user_id = discord_user_id
         self.guild_id = guild_id
+        # None when this view was sent by the Firestore listener rather
+        # than from a slash-command interaction -- there's no interaction
+        # to log activity against in that path (see _finish_verification).
         self.source_interaction = source_interaction
 
     @discord.ui.button(label='I agree', style=discord.ButtonStyle.success)
@@ -175,10 +131,7 @@ class RulesAgreeView(discord.ui.View):
         self.stop()
 
 
-EXPIRY_MS_TIMEOUT = 15 * 60  # seconds, matches the session's own expiry
-
-
-async def _finish_verification(interaction: discord.Interaction, discord_user_id: int, guild_id: int, source_interaction: discord.Interaction):
+async def _finish_verification(interaction: discord.Interaction, discord_user_id: int, guild_id: int, source_interaction: discord.Interaction | None):
     session = await get_session(str(discord_user_id))
 
     if not session:
@@ -224,10 +177,16 @@ async def _finish_verification(interaction: discord.Interaction, discord_user_id
 
     await clear_session(str(discord_user_id))
 
-    await log_command_activity(
-        source_interaction, subcommand='verifyComplete', success=True,
-        fields={'discordUser': interaction.user},
-    )
+    if source_interaction is not None:
+        await log_command_activity(
+            source_interaction, subcommand='verifyComplete', success=True,
+            fields={'discordUser': interaction.user},
+        )
+    else:
+        # Triggered via the Firestore listener's auto-DM flow -- there's no
+        # originating slash-command interaction to attach a log entry to,
+        # so just print instead; it still shows up in bot process logs.
+        print(f'[verify] {interaction.user} ({interaction.user.id}) completed verification via listener-driven flow')
 
     return await interaction.followup.send('Verified! Role assigned. Welcome!', ephemeral=True)
 
@@ -238,6 +197,11 @@ async def _run_verify_start(interaction: discord.Interaction):
     ephemeral=True only makes the initial "thinking" state ephemeral,
     subsequent followups need it passed explicitly, or they post
     publicly in the panel's channel.
+
+    The DM sent here only ever contains the OAuth link button. There's no
+    "Continue" button anymore -- once the user approves the OAuth consent
+    screen and lands back on the Vercel success page, utils/verify_listener.py
+    notices the Firestore write and DMs the rules-agreement step on its own.
     """
     if interaction.guild is None:
         return await interaction.response.send_message('This command only works inside a server.', ephemeral=True)
@@ -273,19 +237,20 @@ async def _run_verify_start(interaction: discord.Interaction):
         description=(
             "Click **Authorize with Discord** below and approve the request. This just confirms "
             "you're a real Discord account, nothing else is shared.\n\n"
-            "Once you've approved it, come back here and click **Continue** to review and accept the "
-            "server rules -- your role is assigned right after.\n\n"
+            "Once you approve it, I'll automatically DM you the server rules to accept -- "
+            "your role is assigned right after.\n\n"
             f"This link expires <t:{int(session['expiresAt'] / 1000)}:R>."
         ),
         color=0x00B0F4,
     )
 
-    view = VerifyDMView(
-        discord_user_id=interaction.user.id,
-        guild_id=interaction.guild_id,
-        authorize_url=authorize_url,
-        source_interaction=interaction,
-    )
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(
+        label='Authorize with Discord',
+        style=discord.ButtonStyle.link,
+        url=authorize_url,
+        emoji='🔗',
+    ))
 
     try:
         await interaction.user.send(embed=embed, view=view)
