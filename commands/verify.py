@@ -1,36 +1,36 @@
-"""/verify command -- Roblox OAuth2 account verification.
+"""/verify command -- Discord OAuth2 + rules-agreement verification.
 
-Old flow: bot generates a code -> user pastes it into their Roblox profile
-description -> bot polls the description via the public users API.
+Flow:
+  1. /verify start (or panel button) -> DM with a link button to Discord's
+     own OAuth2 consent screen (scope: identify).
+  2. Discord redirects to our Vercel /api/callback, which exchanges the
+     code, confirms the authorizing user really is this discordId, and
+     flips the session to "oauth_done".
+  3. User comes back to Discord, clicks "Continue" -> sees the rules ->
+     clicks "I agree" -> session flips to "rules_agreed" and the role is
+     assigned immediately (no external platform to check anymore).
 
-New flow: bot generates a signed `state` -> user is DM'd a link button
-straight to Roblox's OAuth consent screen (scopes: openid, profile,
-group:read) -> Roblox redirects to our Vercel /api/callback, which
-exchanges the code, calls userinfo, and flips the Firestore session doc
-to "authorized" -> user comes back to Discord and clicks "I've
-authorized", which is when we actually assign the role.
-
-Nothing here ever touches a Roblox password/cookie, and the bot process
-never has to run its own public HTTP endpoint -- Vercel already has one
-for /api/validate, so the callback just lives next to it.
+Roblox-specific commands (/verify profile, /verify linkgroup, etc.) are
+gone -- there's no external identity left to look up.
 """
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 from utils.logger import log_command_activity
-from utils.products import get_products_by_ids
 from utils.verification import (
     build_authorize_url,
     clear_session,
     create_session,
-    fetch_roblox_profile_details,
     get_guild_config,
     get_session,
     get_verified_user,
+    mark_rules_agreed,
     remove_verified_user,
     save_verified_user,
     set_guild_role,
+    set_guild_rules,
+    snowflake_created_at_ms,
 )
 
 COMMAND_NAME = 'verify'
@@ -39,55 +39,44 @@ LOG_SCHEMA = {
     'subcommands': {
         'start': {'label': 'Verify — Start', 'fields': ['discordUser']},
         'setrole': {'label': 'Verify — Set Role', 'fields': ['discordUser', 'role']},
-        'unverify': {'label': 'Verify — Unverify', 'fields': ['discordUser', 'robloxUsername']},
-        'profile': {'label': 'Verify — Profile Lookup', 'fields': ['discordUser', 'targetUser']},
-        'verifyComplete': {'label': 'Verify — Completed', 'fields': ['discordUser', 'robloxUsername']},
+        'setrules': {'label': 'Verify — Set Rules', 'fields': ['discordUser']},
+        'unverify': {'label': 'Verify — Unverify', 'fields': ['discordUser']},
+        'verifyComplete': {'label': 'Verify — Completed', 'fields': ['discordUser']},
         'sendpanel': {'label': 'Verify — Panel Sent', 'fields': ['discordUser', 'channel']},
     },
 }
 
-
-def _paginate_list_field(embed: discord.Embed, label: str, items: list[str], page: int, page_size: int):
-    total_pages = max(1, -(-len(items) // page_size))
-    clamped_page = min(page, total_pages - 1)
-    start = clamped_page * page_size
-    chunk = items[start:start + page_size]
-    value = '\n'.join(chunk) if chunk else 'None'
-    embed.add_field(name=f'{label} ({len(items)}) — Page {clamped_page + 1}/{total_pages}', value=value, inline=False)
-    return embed
+DEFAULT_RULES_TEXT = (
+    "By verifying you agree to follow this server's rules, be respectful to other "
+    "members, and follow Discord's Terms of Service and Community Guidelines."
+)
 
 
 # ---------------------------------------------------------------------------
-# /verify unverify -- confirm-via-modal flow (unchanged)
+# /verify unverify -- simple confirm button (no username to type anymore,
+# there's nothing external to double check against)
 # ---------------------------------------------------------------------------
-class UnverifyModal(discord.ui.Modal, title='Confirm Unverify'):
-    roblox_username = discord.ui.TextInput(
-        label='Type your Roblox username to confirm',
-        placeholder='Your exact Roblox username',
-        style=discord.TextStyle.short,
-        required=True,
-    )
-
-    def __init__(self, source_interaction: discord.Interaction):
-        super().__init__()
+class UnverifyConfirmView(discord.ui.View):
+    def __init__(self, *, owner_id: int, source_interaction: discord.Interaction):
+        super().__init__(timeout=60)
+        self.owner_id = owner_id
         self.source_interaction = source_interaction
 
-    async def on_submit(self, interaction: discord.Interaction):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message('Only the person who ran this command can use this button.', ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label='Yes, unverify me', style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
 
         record = await get_verified_user(str(interaction.user.id))
         if not record:
             return await interaction.followup.send('You are already not verified!')
 
-        typed = self.roblox_username.value.strip()
-        if typed != record['robloxUsername']:
-            return await interaction.followup.send(
-                f"Username didn't match. You typed `{typed}`, expected `{record['robloxUsername']}`. "
-                f"Run `/verify unverify` again to retry."
-            )
-
         config = await get_guild_config(str(interaction.guild_id))
-
         if config and config.get('verifiedRoleId'):
             try:
                 guild = interaction.guild
@@ -101,152 +90,27 @@ class UnverifyModal(discord.ui.Modal, title='Confirm Unverify'):
         await remove_verified_user(str(interaction.user.id))
 
         await log_command_activity(
-            self.source_interaction,
-            subcommand='unverify',
-            success=True,
-            fields={'discordUser': interaction.user, 'robloxUsername': record['robloxUsername']},
+            self.source_interaction, subcommand='unverify', success=True,
+            fields={'discordUser': interaction.user},
         )
 
+        self.stop()
         return await interaction.followup.send('You have been unverified. Your role and verification data have been removed.')
 
-
-# ---------------------------------------------------------------------------
-# /verify profile -- tabbed, paginated profile card (unchanged)
-# ---------------------------------------------------------------------------
-class ProfileView(discord.ui.View):
-    PAGE_SIZE = 10
-
-    def __init__(self, *, owner_id: int, target: discord.User, record: dict, details: dict, owned_products: list[dict]):
-        super().__init__(timeout=5 * 60)
-        self.owner_id = owner_id
-        self.target = target
-        self.record = record
-        self.details = details
-        self.owned_products = owned_products
-        self.tab = 'overview'
-        self.page = 0
-        self.message: discord.Message | None = None
-        self._build_components()
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message(
-                'Only the person who ran this command can use these buttons.', ephemeral=True
-            )
-            return False
-        return True
-
-    def build_embed(self) -> discord.Embed:
-        embed = discord.Embed(title=f'Roblox Profile — {self.details["username"]}', color=0x00B0F4)
-        embed.set_footer(text=f'Discord: {self.target.name}')
-
-        if self.tab == 'overview':
-            created_raw = self.details.get('created')
-            account_age_days = None
-            if created_raw:
-                try:
-                    import datetime
-                    created_dt = datetime.datetime.fromisoformat(created_raw.replace('Z', '+00:00'))
-                    now = datetime.datetime.now(datetime.timezone.utc)
-                    account_age_days = (now - created_dt).days
-                except Exception:  # noqa: BLE001
-                    account_age_days = None
-
-            embed.add_field(name='Discord User', value=self.target.mention, inline=True)
-            embed.add_field(name='Roblox Username', value=self.details['username'], inline=True)
-            embed.add_field(name='Display Name', value=self.details.get('displayName') or self.details['username'], inline=True)
-            embed.add_field(
-                name='Account Age',
-                value='Unknown' if account_age_days is None else f'{account_age_days} days',
-                inline=True,
-            )
-            embed.add_field(name='Verified Badge', value='Yes' if self.details.get('hasVerifiedBadge') else 'No', inline=True)
-            embed.add_field(name='Groups', value=str(len(self.details['groups'])), inline=True)
-            return embed
-
-        if self.tab == 'groups':
-            items = [f'{g["name"]} — {g["role"]}' for g in self.details['groups']]
-            return _paginate_list_field(embed, 'Groups', items, self.page, self.PAGE_SIZE)
-
-        if self.tab == 'products':
-            items = [f'{p["name"]} — {p["price"]}' for p in self.owned_products]
-            return _paginate_list_field(embed, 'Owned Products', items, self.page, self.PAGE_SIZE)
-
-        verified_at = self.record.get('verifiedAt')
-        verified_at_str = f'<t:{int(verified_at / 1000)}:F>' if verified_at else 'Unknown'
-        embed.add_field(name='Roblox ID', value=str(self.record.get('robloxId')), inline=True)
-        embed.add_field(name='Verified At', value=verified_at_str, inline=True)
-        embed.add_field(name='Verified Badge', value='Yes' if self.details.get('hasVerifiedBadge') else 'No', inline=True)
-        return embed
-
-    def _build_components(self, disabled: bool = False):
-        self.clear_items()
-
-        for tab_key, tab_label in (
-            ('overview', 'Overview'),
-            ('groups', 'Groups'),
-            ('products', 'Products'),
-            ('account', 'Account'),
-        ):
-            style = discord.ButtonStyle.primary if self.tab == tab_key else discord.ButtonStyle.secondary
-            btn = discord.ui.Button(label=tab_label, style=style, disabled=disabled, custom_id=f'profile_tab_{tab_key}', row=0)
-
-            async def _tab_cb(interaction: discord.Interaction, key=tab_key):
-                self.tab = key
-                self.page = 0
-                self._build_components()
-                await interaction.response.edit_message(embed=self.build_embed(), view=self)
-
-            btn.callback = _tab_cb
-            self.add_item(btn)
-
-        if self.tab in ('groups', 'products'):
-            items = self.details['groups'] if self.tab == 'groups' else self.owned_products
-            total_pages = max(1, -(-len(items) // self.PAGE_SIZE))
-            if total_pages > 1:
-                prev_btn = discord.ui.Button(
-                    label='◀ Prev', style=discord.ButtonStyle.secondary,
-                    disabled=disabled or self.page == 0, row=1,
-                )
-                next_btn = discord.ui.Button(
-                    label='Next ▶', style=discord.ButtonStyle.secondary,
-                    disabled=disabled or self.page >= total_pages - 1, row=1,
-                )
-
-                async def _prev_cb(interaction: discord.Interaction):
-                    self.page = max(0, self.page - 1)
-                    self._build_components()
-                    await interaction.response.edit_message(embed=self.build_embed(), view=self)
-
-                async def _next_cb(interaction: discord.Interaction):
-                    self.page += 1
-                    self._build_components()
-                    await interaction.response.edit_message(embed=self.build_embed(), view=self)
-
-                prev_btn.callback = _prev_cb
-                next_btn.callback = _next_cb
-                self.add_item(prev_btn)
-                self.add_item(next_btn)
-
-    async def on_timeout(self):
-        self._build_components(disabled=True)
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
+    @discord.ui.button(label='Cancel', style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(content='Cancelled.', view=None)
 
 
 # ---------------------------------------------------------------------------
-# /verify start -- DM with a Roblox OAuth link button + "I've authorized"
-# check-status button
+# /verify start -- DM: OAuth link button -> "Continue" -> rules -> "I agree"
 # ---------------------------------------------------------------------------
 class VerifyDMView(discord.ui.View):
-    """Two buttons: a link button straight to Roblox's consent screen
-    (no callback needed -- Discord opens link buttons directly), and a
-    regular button the user clicks after approving, which is the only
-    point where the bot actually reads the session back and assigns the
-    role.
+    """Step 1: a link button straight to Discord's own consent screen,
+    plus a regular button ("Continue") the user clicks after approving.
+    Clicking Continue is the only point where the bot reads the session
+    back; if it's ready, it swaps this message's view for the rules step.
     """
 
     def __init__(self, *, discord_user_id: int, guild_id: int, authorize_url: str, source_interaction: discord.Interaction):
@@ -256,23 +120,62 @@ class VerifyDMView(discord.ui.View):
         self.source_interaction = source_interaction
 
         self.add_item(discord.ui.Button(
-            label='Continue with Roblox',
+            label='Authorize with Discord',
             style=discord.ButtonStyle.link,
             url=authorize_url,
             emoji='🔗',
         ))
 
-        check_btn = discord.ui.Button(
-            label="I've authorized",
-            style=discord.ButtonStyle.success,
-            custom_id='verify_check_status',
-        )
-        check_btn.callback = self._on_check_status
-        self.add_item(check_btn)
+        continue_btn = discord.ui.Button(label='Continue', style=discord.ButtonStyle.success, custom_id='verify_continue')
+        continue_btn.callback = self._on_continue
+        self.add_item(continue_btn)
 
-    async def _on_check_status(self, interaction: discord.Interaction):
+    async def _on_continue(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        session = await get_session(str(self.discord_user_id))
+        if not session:
+            return await interaction.followup.send(
+                'Your verification session expired. Run `/verify start` again to get a new link.',
+                ephemeral=True,
+            )
+
+        if session['status'] == 'pending':
+            return await interaction.followup.send(
+                "Looks like you haven't finished authorizing yet -- click **Authorize with Discord** "
+                "above, approve it, then come back and click **Continue** again.",
+                ephemeral=True,
+            )
+
+        # oauth_done or rules_agreed both mean the OAuth step is done --
+        # show the rules regardless so unverify+reverify always re-shows them.
+        config = await get_guild_config(str(self.guild_id))
+        rules_text = (config or {}).get('rulesText') or DEFAULT_RULES_TEXT
+
+        embed = discord.Embed(title='Server Rules', description=rules_text, color=0x00B0F4)
+        view = RulesAgreeView(
+            discord_user_id=self.discord_user_id,
+            guild_id=self.guild_id,
+            source_interaction=self.source_interaction,
+        )
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+
+class RulesAgreeView(discord.ui.View):
+    def __init__(self, *, discord_user_id: int, guild_id: int, source_interaction: discord.Interaction):
+        super().__init__(timeout=EXPIRY_MS_TIMEOUT)
+        self.discord_user_id = discord_user_id
+        self.guild_id = guild_id
+        self.source_interaction = source_interaction
+
+    @discord.ui.button(label='I agree', style=discord.ButtonStyle.success)
+    async def agree(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         await _finish_verification(interaction, self.discord_user_id, self.guild_id, self.source_interaction)
+        self.stop()
+
+
+EXPIRY_MS_TIMEOUT = 15 * 60  # seconds, matches the session's own expiry
 
 
 async def _finish_verification(interaction: discord.Interaction, discord_user_id: int, guild_id: int, source_interaction: discord.Interaction):
@@ -286,13 +189,11 @@ async def _finish_verification(interaction: discord.Interaction, discord_user_id
 
     if session['status'] == 'pending':
         return await interaction.followup.send(
-            "Looks like you haven't finished authorizing on Roblox yet -- click **Continue with Roblox** "
-            "above, approve the request, then come back and click this button again.",
+            "You haven't finished authorizing with Discord yet. Run `/verify start` again.",
             ephemeral=True,
         )
 
-    if session['status'] != 'authorized':
-        return await interaction.followup.send('Something went wrong with your verification. Run `/verify start` again.', ephemeral=True)
+    await mark_rules_agreed(str(discord_user_id))
 
     client = interaction.client
     guild = client.get_guild(guild_id) or await client.fetch_guild(guild_id)
@@ -315,9 +216,8 @@ async def _finish_verification(interaction: discord.Interaction, discord_user_id
     try:
         await save_verified_user(
             str(discord_user_id),
-            roblox_id=session['robloxId'],
-            roblox_username=session['robloxUsername'],
             guild_id=str(guild_id),
+            account_created_at=snowflake_created_at_ms(str(discord_user_id)),
         )
     except Exception as save_err:  # noqa: BLE001
         print(f'save_verified_user failed (role already assigned): {save_err}')
@@ -325,20 +225,15 @@ async def _finish_verification(interaction: discord.Interaction, discord_user_id
     await clear_session(str(discord_user_id))
 
     await log_command_activity(
-        source_interaction,
-        subcommand='verifyComplete',
-        success=True,
-        fields={'discordUser': interaction.user, 'robloxUsername': session['robloxUsername']},
+        source_interaction, subcommand='verifyComplete', success=True,
+        fields={'discordUser': interaction.user},
     )
 
-    return await interaction.followup.send(f"Verified! You're linked as **{session['robloxUsername']}**. Role assigned.", ephemeral=True)
+    return await interaction.followup.send('Verified! Role assigned. Welcome!', ephemeral=True)
 
 
 async def _run_verify_start(interaction: discord.Interaction):
-    """Shared body for /verify start and the button on the verify panel
-    (/verify sendpanel). Panel button interactions don't go through the
-    slash-command tree, so this must be self-contained.
-
+    """Shared body for /verify start and the button on the verify panel.
     Every response here is ephemeral=True -- deferring with
     ephemeral=True only makes the initial "thinking" state ephemeral,
     subsequent followups need it passed explicitly, or they post
@@ -374,12 +269,12 @@ async def _run_verify_start(interaction: discord.Interaction):
     authorize_url = build_authorize_url(session['state'])
 
     embed = discord.Embed(
-        title='Roblox Verification',
+        title='Server Verification',
         description=(
-            "Click **Continue with Roblox** below and approve the request. Roblox will ask to share "
-            "your username, profile, and group memberships with this bot -- nothing else, and we never "
-            "see your password.\n\n"
-            f"Once you've approved it, come back here and click **I've authorized**.\n\n"
+            "Click **Authorize with Discord** below and approve the request. This just confirms "
+            "you're a real Discord account, nothing else is shared.\n\n"
+            "Once you've approved it, come back here and click **Continue** to review and accept the "
+            "server rules -- your role is assigned right after.\n\n"
             f"This link expires <t:{int(session['expiresAt'] / 1000)}:R>."
         ),
         color=0x00B0F4,
@@ -460,9 +355,9 @@ class VerifyCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    verify_group = app_commands.Group(name='verify', description='Verify your Roblox account')
+    verify_group = app_commands.Group(name='verify', description='Verify your Discord account to get server access')
 
-    @verify_group.command(name='start', description='Start Roblox verification (DMs you a link)')
+    @verify_group.command(name='start', description='Start verification (DMs you a link)')
     async def start(self, interaction: discord.Interaction):
         await _run_verify_start(interaction)
 
@@ -495,50 +390,28 @@ class VerifyCog(commands.Cog):
         await log_command_activity(interaction, subcommand='setrole', success=True, fields={'discordUser': interaction.user, 'role': role})
         return await interaction.followup.send(f'Verified role set to {role.mention}.')
 
-    @verify_group.command(name='unverify', description='Remove your Roblox verification')
+    @verify_group.command(name='setrules', description='Set the rules text shown during verification')
+    @app_commands.describe(rules='The rules text members must agree to')
+    async def setrules(self, interaction: discord.Interaction, rules: str):
+        if interaction.guild is None:
+            return await interaction.response.send_message('This command only works inside a server.', ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+
+        if not interaction.user.guild_permissions.manage_guild:
+            return await interaction.followup.send('You need Manage Server permission to do that.')
+
+        await set_guild_rules(str(interaction.guild_id), rules)
+        await log_command_activity(interaction, subcommand='setrules', success=True, fields={'discordUser': interaction.user})
+        return await interaction.followup.send('Rules text updated.')
+
+    @verify_group.command(name='unverify', description='Remove your verification')
     async def unverify(self, interaction: discord.Interaction):
         if interaction.guild is None:
             return await interaction.response.send_message('This command only works inside a server.', ephemeral=True)
 
-        # showModal() must be the very first thing that happens on this
-        # interaction -- no Firestore read before it.
-        await interaction.response.send_modal(UnverifyModal(source_interaction=interaction))
-
-    @verify_group.command(name='profile', description="Look up a member's linked Roblox profile")
-    @app_commands.describe(user='Discord user to look up')
-    async def profile(self, interaction: discord.Interaction, user: discord.User):
-        if interaction.guild is None:
-            return await interaction.response.send_message('This command only works inside a server.', ephemeral=True)
-
-        # public (not ephemeral) on purpose -- mods need to see it to catch misuse
-        await interaction.response.defer()
-
-        record = await get_verified_user(str(user.id))
-        if not record:
-            await log_command_activity(
-                interaction, subcommand='profile', success=False,
-                fields={'discordUser': interaction.user, 'targetUser': user},
-                note='Target user is not verified.',
-            )
-            return await interaction.followup.send('The user is not verified!')
-
-        try:
-            details = await fetch_roblox_profile_details(record['robloxId'])
-        except Exception:  # noqa: BLE001
-            await log_command_activity(
-                interaction, subcommand='profile', success=False,
-                fields={'discordUser': interaction.user, 'targetUser': user},
-                note='Roblox API error while fetching profile details.',
-            )
-            return await interaction.followup.send('Bot error while contacting Roblox. Try again later.')
-
-        await log_command_activity(interaction, subcommand='profile', success=True, fields={'discordUser': interaction.user, 'targetUser': user})
-
-        owned_products = await get_products_by_ids(record.get('ownedProducts') or [])
-
-        view = ProfileView(owner_id=interaction.user.id, target=user, record=record, details=details, owned_products=owned_products)
-        message = await interaction.followup.send(embed=view.build_embed(), view=view, wait=True)
-        view.message = message
+        view = UnverifyConfirmView(owner_id=interaction.user.id, source_interaction=interaction)
+        await interaction.response.send_message('Are you sure you want to unverify? This removes your role.', view=view, ephemeral=True)
 
 
 async def setup(bot: commands.Bot):
