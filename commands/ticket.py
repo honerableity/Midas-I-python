@@ -14,7 +14,6 @@ from discord.ext import commands
 
 from utils.logger import log_command_activity
 from utils.products import (
-    auto_whitelist_product_for_user,
     build_product_delivery_dm,
     get_product,
     give_product_to_user,
@@ -618,11 +617,6 @@ class DoneModal(discord.ui.Modal, title='Testimonial Image'):
                 print(f"Failed to grant product {item['productId']} to {self.ticket['creatorId']}: {err}")
                 failures.append(item['name'])
                 continue
-
-            try:
-                await auto_whitelist_product_for_user(item['productId'], self.ticket['creatorId'])
-            except Exception as err:  # noqa: BLE001
-                print(f"auto_whitelist_product_for_user failed for {item['productId']} / {self.ticket['creatorId']} (product still granted): {err}")
 
             product = await get_product(item['productId'])
             if not creator or not product or not product.get('fileLink'):
